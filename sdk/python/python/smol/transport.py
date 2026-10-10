@@ -2183,7 +2183,7 @@ def connect_transport(machine_id: str, conn: Optional[ConnectOptions] = None) ->
             # Frozen and durably paused machines are not agent-ready. A paused
             # machine must be resumed explicitly before it can serve work.
             if transport.state() not in ("frozen", "paused", "pausing"):
-                transport.wait_until_ready()
+                _wait_for_execution(transport, 120.0)
             return transport
         except Exception as e:  # noqa: BLE001
             raise wrap_native_error(e) from e
