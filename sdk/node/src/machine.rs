@@ -164,6 +164,23 @@ impl NapiMachine {
         }
     }
 
+    /// Stage a local archive or rootfs directory before creating the machine.
+    /// Large archives are hashed off the JavaScript event loop.
+    #[napi]
+    pub async fn prepare_image(image: String) -> napi::Result<String> {
+        tokio::task::spawn_blocking(move || {
+            use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+            resolve(classify(&image)).map(|resolved| match resolved {
+                ResolvedImage::Registry(reference) | ResolvedImage::Local { reference, .. } => {
+                    reference
+                }
+            })
+        })
+        .await
+        .map_err(join_error)?
+        .into_napi()
+    }
+
     /// Create a new machine. Does not start the VM yet — call `start()`.
     #[napi(constructor)]
     pub fn new(config: MachineConfig) -> napi::Result<Self> {

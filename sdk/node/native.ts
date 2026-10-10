@@ -182,6 +182,7 @@ export interface NapiMachine {
 
 export interface NapiMachineCtor {
   new (config: NativeMachineConfig): NapiMachine;
+  prepareImage(image: string): Promise<string>;
   connect(name: string, interceptorAddress?: string, interceptorToken?: string): NapiMachine;
   list(): Promise<NativeMachineSummary[]>;
   restoreCheckpoint(name: string, artifact: string, keepIdentity?: boolean): NapiMachine;
