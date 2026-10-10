@@ -108,10 +108,11 @@ try {
 }
 ```
 
-For a local VM whose published service starts through `exec()`, set
-`waitForPorts: false` on creation. The SDK still waits for the guest agent,
-so `exec()` is safe; call `waitUntilReady()` once the service is listening.
-The default keeps waiting for all published ports. This option is local-only.
+When a published service starts through `exec()` (local or cloud), set
+`waitForPorts: false` on creation. The SDK waits for the guest agent so
+`exec()` can start the listener; call `waitUntilReady()` once the service is
+listening. The default waits for all published ports. Select
+`{ target: 'cloud' }` to use the same flow on Smol Cloud.
 
 ```ts
 const m = await Machine.create(
@@ -130,10 +131,13 @@ try {
 }
 ```
 
-When reconnecting to clean up a local machine whose published service has
+When reconnecting to a running local machine whose published service has
 stopped, `Machine.connect(name, { target: 'local', waitForPorts: false })`
-attaches after the agent is ready, so `delete()` can run without a listener.
-The default continues waiting for all published ports.
+attaches after the agent is ready, without waiting for the listener. Cloud
+`connect()` normally attaches without waiting; with `waitForPorts: false`, it
+waits for a successful guest-agent command without requiring the port to be
+open. Connect without that flag to inspect or delete a stopped or paused cloud
+machine.
 
 To reach a service **inside** the VM, use the authenticated connect bridge —
 **no Cloudflare/localhost.run tunnel, no public exposure, no egress allow-list.**
