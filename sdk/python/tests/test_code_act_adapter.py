@@ -12,7 +12,7 @@ import pytest
 pytest.importorskip("agent_framework_tools")
 
 from smol.code_act import SmolCodeActProvider, SmolExecuteCodeTool
-from smol.types import ConnectOptions, ExecResult
+from smol.types import ConnectOptions
 
 
 class FakeMachine:
@@ -31,9 +31,10 @@ class FakeMachine:
         cls.created.append((config, conn))
         return cls()
 
-    async def exec(self, command: list[str], opts: object) -> ExecResult:
+    async def exec_stream(self, command: list[str], opts: object):
         self.commands.append((command, opts))
-        return ExecResult(exit_code=self.exit_code, stdout=self.stdout, stderr="")
+        yield {"kind": "stdout", "data": self.stdout}
+        yield {"kind": "exit", "exit_code": self.exit_code}
 
     async def delete(self) -> None:
         self.deleted = True
@@ -54,7 +55,8 @@ def test_code_is_one_quoted_argument_and_vm_is_disposable() -> None:
             machine = FakeMachine.instances[0]
             argv, options = machine.commands[0]
             assert argv[:2] == ["/bin/sh", "-c"]
-            assert shlex.split(argv[2]) == ["python3", "-c", code]
+            assert argv[2] == 'exec "$@" </dev/null'
+            assert shlex.split(argv[-1]) == ["python3", "-c", code]
             assert options.workdir == "/workspace"
             assert result.stdout == "hello\n"
             assert not machine.deleted
