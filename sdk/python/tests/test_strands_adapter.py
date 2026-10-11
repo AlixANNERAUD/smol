@@ -170,13 +170,31 @@ def test_cloud_default_expires_if_caller_exits_and_invalid_env_does_not_boot_vm(
 def test_agent_registers_vm_shell_and_file_editor():
     from strands import Agent
 
-    sandbox = SmolSandbox(machine=Mock())
+    machine = Mock()
+    machine.exec_stream.side_effect = lambda *args: Events(
+        [{"kind": "stdout", "data": "42"}, {"kind": "exit", "exit_code": 0}]
+    )
+    sandbox = SmolSandbox(machine=machine)
     try:
         agent = Agent(model="nonsense", sandbox=sandbox)
         assert agent.sandbox is sandbox
         assert {"sandbox_file_editor", "sandbox_shell"}.issubset(
             agent.tool_registry.registry
         )
+        shell = agent.tool_registry.registry["sandbox_shell"]
+        result = asyncio.run(shell(command="printf 42", tool_context=None))
+        assert result == {"output": "42", "error": "", "exit_code": 0}
+        editor = agent.tool_registry.registry["sandbox_file_editor"]
+        created = asyncio.run(
+            editor(
+                command="create",
+                path="/workspace/answer.txt",
+                file_text="42\n",
+                tool_context=None,
+            )
+        )
+        assert "File created successfully" in created
+        machine.write_file.assert_called_once_with("/workspace/answer.txt", b"42\n")
     finally:
         sandbox.close()
 
