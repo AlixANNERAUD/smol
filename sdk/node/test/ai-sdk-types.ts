@@ -1,6 +1,6 @@
 // Compile against the published AI SDK contract without making `ai` a
 // runtime dependency of smolmachines/ai-sdk or its generated declarations.
-import type { Experimental_SandboxSession } from "ai";
+import type { Experimental_SandboxSession } from "ai" with { "resolution-mode": "import" };
 import { createSandboxSession, type SmolSandboxSession } from "../ai-sdk";
 import type { Machine } from "../machine";
 
