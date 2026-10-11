@@ -49,6 +49,8 @@ jobs:
         run: npx tsc -p tsconfig.json --noEmit
       - name: Check AI SDK sandbox contract
         run: npx tsc -p tsconfig.ai-sdk.json --noEmit
+      - name: Check AI SDK bootstrap cancellation
+        run: npx tsx test/ai-sdk-bootstrap-abort.ts
 
   rust-check:
     name: Rust · fmt, clippy, tests

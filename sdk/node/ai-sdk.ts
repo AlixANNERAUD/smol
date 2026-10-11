@@ -213,6 +213,9 @@ export function createSandboxSession(machine: Machine, options: SandboxSessionOp
   const spawn = async (opts: SandboxProcessOptions): Promise<SandboxProcess> => {
     throwIfAborted(opts.abortSignal);
     await ensureRoot();
+    // Bootstrap can take time; an abort during it must stop the command
+    // before registering a listener (which would miss an earlier abort).
+    throwIfAborted(opts.abortSignal);
     const control = new AbortController();
     let killed = false;
     const onAbort = () => control.abort(opts.abortSignal?.reason);
@@ -312,6 +315,7 @@ export function createSandboxSession(machine: Machine, options: SandboxSessionOp
     async run(opts) {
       throwIfAborted(opts.abortSignal);
       await ensureRoot();
+      throwIfAborted(opts.abortSignal);
       const control = new AbortController();
       const onAbort = () => control.abort(opts.abortSignal?.reason);
       opts.abortSignal?.addEventListener("abort", onAbort, { once: true });
