@@ -70,21 +70,45 @@ def _parse_result(value: object) -> str | list[Content]:
     ]
 
 
-def _limit_output(stdout: bytes, stderr: bytes, limit: int) -> tuple[str, str, bool]:
+class _CapturedStream:
+    """Remember only the first and last bytes of a guest output stream."""
+
+    def __init__(self, limit: int) -> None:
+        self.head_limit = (limit + 1) // 2
+        self.tail_limit = limit - self.head_limit
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+
+    def append(self, text: str) -> None:
+        data = text.encode("utf-8", "replace")
+        self.total += len(data)
+        missing = self.head_limit - len(self.head)
+        if missing > 0:
+            self.head.extend(data[:missing])
+        if self.tail_limit:
+            self.tail = (self.tail + data)[-self.tail_limit :]
+
+    def view(self, budget: int) -> str:
+        if self.total <= budget:
+            # The tail may overlap the head for short outputs. Take the
+            # remainder from the head exactly once before adding the tail.
+            missing = max(0, self.total - len(self.tail))
+            data = bytes(self.head[:missing] + self.tail)
+        else:
+            head = (budget + 1) // 2
+            tail = budget - head
+            data = bytes(self.head[:head] + (self.tail[-tail:] if tail else b""))
+        return data.decode("utf-8", "replace")
+
+
+def _limit_output(stdout: _CapturedStream, stderr: _CapturedStream, limit: int) -> tuple[str, str, bool]:
     """Keep both streams within the combined byte cap, reserving error space."""
-    truncated = len(stdout) + len(stderr) > limit
-    stderr_limit = min(len(stderr), limit // 2)
-    stdout_limit = min(len(stdout), limit - stderr_limit)
-    stderr_limit = min(len(stderr), limit - stdout_limit)
-
-    def keep_ends(data: bytes, size: int) -> str:
-        if len(data) <= size:
-            return data.decode("utf-8", "replace")
-        head = (size + 1) // 2
-        tail = size - head
-        return (data[:head] + (data[-tail:] if tail else b"")).decode("utf-8", "replace")
-
-    return keep_ends(stdout, stdout_limit), keep_ends(stderr, stderr_limit), truncated
+    truncated = stdout.total + stderr.total > limit
+    stderr_limit = min(stderr.total, limit // 2)
+    stdout_limit = min(stdout.total, limit - stderr_limit)
+    stderr_limit = min(stderr.total, limit - stdout_limit)
+    return stdout.view(stdout_limit), stderr.view(stderr_limit), truncated
 
 
 class SmolShellTool:
@@ -215,36 +239,63 @@ class SmolShellTool:
             if self._machine is None:
                 raise RuntimeError("Smol VM is closed")
             started = time.monotonic()
-            # The SDK offloads sync I/O to a thread. Shield the task and wait
-            # for the guest-enforced timeout on cancellation so an abandoned
-            # tool call cannot keep running after its owner has moved on.
-            task = asyncio.create_task(
-                self._machine.exec(
-                    [self._shell, "-c", command],
-                    ExecOptions(env=self._env or None, workdir=self._workdir, timeout=effective_timeout),
-                )
-            )
+            # The SDK yields events as they arrive, so a noisy guest cannot
+            # allocate its entire output in the agent process before the cap.
+            stdout = _CapturedStream(self._max_output_bytes)
+            stderr = _CapturedStream(self._max_output_bytes)
+            exit_code: int | None = None
+
+            async def read_stream() -> None:
+                nonlocal exit_code
+                # The inner shell closes stdin on local releases that leave
+                # streamed-exec stdin open, then replaces itself with the
+                # requested shell without changing its exit status.
+                argv = ["/bin/sh", "-c", 'exec "$@" </dev/null', "sh", self._shell, "-c", command]
+                async for event in self._machine.exec_stream(
+                    argv, ExecOptions(env=self._env or None, workdir=self._workdir, timeout=effective_timeout)
+                ):
+                    kind = event.get("kind")
+                    if kind == "stdout" or kind == "stderr":
+                        data = event.get("data")
+                        if not isinstance(data, str):
+                            raise ShellExecutionError("Smol VM returned invalid command output")
+                        (stdout if kind == "stdout" else stderr).append(data)
+                    elif kind == "exit":
+                        code = event.get("exit_code")
+                        if type(code) is not int:
+                            raise ShellExecutionError("Smol VM returned an invalid exit status")
+                        exit_code = code
+                    elif kind == "error":
+                        raise ShellExecutionError("Smol VM command stream failed")
+                    else:
+                        raise ShellExecutionError("Smol VM returned an unknown command event")
+
+            timed_out = False
+            task = asyncio.create_task(asyncio.wait_for(read_stream(), timeout=effective_timeout))
             try:
-                result = await asyncio.shield(task)
+                await asyncio.shield(task)
             except asyncio.CancelledError:
+                # Keep the activity alive until the guest deadline or exit,
+                # including on repeated cancellation, as for buffered exec.
                 try:
                     await _finish_after_cancellation(task)
                 finally:
                     raise
+            except asyncio.TimeoutError:
+                timed_out = True
+                exit_code = 124
             except SmolError as error:
                 raise ShellExecutionError(f"Smol VM exec failed ({error.code}): {error}") from error
-            stdout, stderr, truncated = _limit_output(
-                result.stdout_bytes or result.stdout.encode("utf-8", "replace"),
-                result.stderr_bytes or result.stderr.encode("utf-8", "replace"),
-                self._max_output_bytes,
-            )
+            if exit_code is None:
+                raise ShellExecutionError("Smol VM command stream ended without an exit status")
+            out, err, truncated = _limit_output(stdout, stderr, self._max_output_bytes)
             return ShellResult(
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=result.exit_code,
+                stdout=out,
+                stderr=err,
+                exit_code=exit_code,
                 duration_ms=round((time.monotonic() - started) * 1000),
-                truncated=truncated or result.stdout_truncated or result.stderr_truncated,
-                timed_out=result.exit_code == 124 and "timed out" in result.stderr.lower(),
+                truncated=truncated,
+                timed_out=timed_out or (exit_code == 124 and "timed out" in err.lower()),
             )
 
     def as_function(

@@ -177,7 +177,7 @@ commands; each call starts a new shell, so `cd` and shell variables do not.
 Networking is off by default and can be configured with `MachineConfig` and
 `ResourceSpec` (including allowed hosts). Agent calls through `as_function()`
 require approval by default, matching Agent Framework's shell tools; direct
-`run()` calls do not ask for approval. Use one tool per agent session.
+`run()` calls do not ask for approval. Use one tool per agent session. Command output is streamed into a bounded 64 KiB head-and-tail preview by default, so a noisy guest does not fill the agent process's memory. Cancellation waits until the guest command has exited or reached its timeout; Cloud commands may continue until their guest-enforced timeout after a disconnected client.
 
 ### NeMo Gym sandbox provider
 

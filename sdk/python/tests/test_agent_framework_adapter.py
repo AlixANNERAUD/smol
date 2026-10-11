@@ -13,7 +13,7 @@ from agent_framework.tools import ShellCommandError, ShellExecutionError, ShellP
 
 from smol.agent_framework import SmolShellTool
 from smol.errors import SmolError
-from smol.types import ConnectOptions, ExecResult
+from smol.types import ConnectOptions
 
 
 class FakeMachine:
@@ -35,16 +35,14 @@ class FakeMachine:
         cls.created.append((config, conn))
         return cls()
 
-    async def exec(self, command: list[str], opts: object) -> ExecResult:
+    async def exec_stream(self, command: list[str], opts: object):
         self.commands.append((command, opts))
         await self.wait.wait()
-        return ExecResult(
-            exit_code=self.exit_code,
-            stdout=self.stdout.decode("utf-8", "replace"),
-            stderr=self.stderr.decode("utf-8", "replace"),
-            stdout_bytes=self.stdout,
-            stderr_bytes=self.stderr,
-        )
+        if self.stdout:
+            yield {"kind": "stdout", "data": self.stdout.decode("utf-8", "replace")}
+        if self.stderr:
+            yield {"kind": "stderr", "data": self.stderr.decode("utf-8", "replace")}
+        yield {"kind": "exit", "exit_code": self.exit_code}
 
     async def delete(self) -> None:
         self.deleted = True
@@ -63,7 +61,7 @@ def test_owned_vm_uses_guest_shell_and_deletes_on_exit() -> None:
             result = await shell.run("echo hi")
             machine = FakeMachine.instances[0]
             assert result.stdout == "hi\n" and result.exit_code == 0
-            assert machine.commands[0][0] == ["/bin/sh", "-c", "echo hi"]
+            assert machine.commands[0][0] == ["/bin/sh", "-c", 'exec "$@" </dev/null', "sh", "/bin/sh", "-c", "echo hi"]
             assert machine.commands[0][1].workdir == "/workspace"
             assert machine.commands[0][1].timeout == 30
             assert FakeMachine.created[0][0].resources.network is False
@@ -119,10 +117,11 @@ def test_exec_error_uses_framework_error_type(monkeypatch: pytest.MonkeyPatch) -
     async def scenario() -> None:
         machine = FakeMachine()
 
-        async def broken_exec(*_args: object) -> ExecResult:
+        async def broken_exec(*_args: object):
             raise SmolError("NOT_FOUND", "machine stopped")
+            yield  # Keep this as an async iterator for the streaming API.
 
-        monkeypatch.setattr(machine, "exec", broken_exec)
+        monkeypatch.setattr(machine, "exec_stream", broken_exec)
         with pytest.raises(ShellExecutionError, match="machine stopped") as error:
             await SmolShellTool(machine=machine).run("echo hi")
         assert isinstance(error.value.__cause__, SmolError)
@@ -269,3 +268,39 @@ def test_invalid_settings_fail_before_vm_creation() -> None:
         SmolShellTool(workdir="relative")
     with pytest.raises(ValueError):
         SmolShellTool(machine=FakeMachine(), conn=ConnectOptions(target="cloud"))
+
+
+def test_streamed_output_keeps_bounded_head_tail() -> None:
+    from smol.agent_framework import _CapturedStream
+
+    output = _CapturedStream(20)
+    for _ in range(128):
+        output.append("begin" + "x" * 1000 + "end")
+    assert output.total > 100_000
+    assert len(output.head) + len(output.tail) <= 20
+    assert output.view(20).startswith("begin")
+    assert output.view(20).endswith("end")
+
+
+def test_guest_command_timeout_returns_typed_result() -> None:
+    async def scenario() -> None:
+        machine = FakeMachine()
+        machine.wait.clear()
+        result = await SmolShellTool(machine=machine).run("sleep 10", timeout=0.01)
+        assert result.exit_code == 124 and result.timed_out
+
+    asyncio.run(scenario())
+
+
+def test_guest_stream_without_exit_fails() -> None:
+    async def scenario() -> None:
+        machine = FakeMachine()
+
+        async def missing_exit(*_args: object):
+            yield {"kind": "stdout", "data": "incomplete"}
+
+        machine.exec_stream = missing_exit  # type: ignore[method-assign]
+        with pytest.raises(ShellExecutionError, match="without an exit status"):
+            await SmolShellTool(machine=machine).run("echo incomplete")
+
+    asyncio.run(scenario())
