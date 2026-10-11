@@ -92,7 +92,9 @@ class Machine:
         * local (default): re-opens a persisted machine by NAME, starting it if
           stopped — pairs with ``Machine.create(MachineConfig(name=…),
           persistent=True)``. A paused machine stays paused until you call
-          :meth:`resume` to restore its saved execution.
+          :meth:`resume` to restore its saved execution. Set
+          ``ConnectOptions(wait_for_ports=False)`` to attach once guest execution
+          works when an application port is closed.
         * cloud: looks up the machine by id; raises if it doesn't exist.
 
           This does not wait for readiness; call :meth:`wait_until_ready`
