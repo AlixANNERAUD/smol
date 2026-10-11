@@ -85,10 +85,13 @@ def test_connect_to_paused_local_machine_does_not_wait_for_agent():
             return "paused"
 
     with mock.patch.object(transport_module, "_load_native", return_value=SimpleNamespace(Machine=FakeMachine)), \
-         mock.patch.object(transport_module.LocalTransport, "wait_until_ready", side_effect=AssertionError("paused VM is not ready")):
-        attached = transport_module.connect_transport("saved", ConnectOptions(target="local"))
-
-    assert attached.state() == "paused"
+         mock.patch.object(transport_module.LocalTransport, "wait_until_ready", side_effect=AssertionError("paused VM is not ready")), \
+         mock.patch.object(transport_module, "_wait_for_execution", side_effect=AssertionError("paused VM cannot exec")):
+        for wait_for_ports in (True, False):
+            attached = transport_module.connect_transport(
+                "saved", ConnectOptions(target="local", wait_for_ports=wait_for_ports)
+            )
+            assert attached.state() == "paused"
 
 
 def test_cloud_rejects_local_interceptor_before_network_call():
