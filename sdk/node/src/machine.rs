@@ -8,6 +8,7 @@ use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 
 use crate::error::IntoNapiResult;
+use crate::exec_stream_utf8::Utf8ExecStream;
 use crate::types::*;
 use smolvm::agent::ExecEvent;
 use smolvm::embedded::{runtime, ForkSourcePolicy, MachineSpec};
@@ -101,23 +102,57 @@ pub struct NapiMachine {
 
 /// A live, incremental exec stream. `next()` resolves with the next event as it
 /// arrives (off the libuv loop via spawn_blocking), or `null` once the command
-/// exits and the channel closes. Mirrors the Python SDK's ExecStream iterator.
+/// exits and the channel closes. Only an incomplete UTF-8 code point is held
+/// across events. Mirrors the Python SDK's ExecStream iterator.
 #[napi]
 pub struct ExecStream {
-    rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<ExecEvent>>>,
+    rx: std::sync::Arc<std::sync::Mutex<ExecStreamReceiver>>,
     cancel: smolvm::embedded::ExecCancel,
+}
+
+struct ExecStreamReceiver {
+    rx: std::sync::mpsc::Receiver<ExecEvent>,
+    decoder: Utf8ExecStream,
+    done: bool,
+}
+
+impl ExecStreamReceiver {
+    fn next(&mut self) -> Option<ExecStreamEvent> {
+        loop {
+            if let Some(event) = self.decoder.pop() {
+                return Some(event.into());
+            }
+            if self.done {
+                return None;
+            }
+            match self.rx.recv() {
+                Ok(event) => self.decoder.push(event),
+                Err(_) => {
+                    self.done = true;
+                    self.decoder.finish();
+                }
+            }
+        }
+    }
 }
 
 #[napi]
 impl ExecStream {
     #[napi]
     pub async fn next(&self) -> napi::Result<Option<ExecStreamEvent>> {
+        if self.cancel.is_cancelled() {
+            return Ok(None);
+        }
         let rx = self.rx.clone();
-        let received =
-            tokio::task::spawn_blocking(move || rx.lock().expect("exec stream lock").recv())
+        let event =
+            tokio::task::spawn_blocking(move || rx.lock().expect("exec stream lock").next())
                 .await
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        Ok(received.ok().map(ExecStreamEvent::from))
+        if self.cancel.is_cancelled() {
+            Ok(None)
+        } else {
+            Ok(event)
+        }
     }
 
     /// Kill the command: its connection closes and the guest agent kills it.
@@ -389,7 +424,7 @@ impl NapiMachine {
 
     /// Start a command and return a live `ExecStream` of its output events. A
     /// worker thread drives the engine's `exec_streaming_with` and feeds an mpsc
-    /// channel the stream drains incrementally (no buffering).
+    /// channel the stream drains incrementally (apart from partial UTF-8).
     #[napi]
     pub fn exec_stream(&self, command: Vec<String>, options: Option<ExecOptions>) -> ExecStream {
         let name = self.name.clone();
@@ -410,7 +445,11 @@ impl NapiMachine {
             // Senders drop here → channel closes → next() resolves null.
         });
         ExecStream {
-            rx: std::sync::Arc::new(std::sync::Mutex::new(rx)),
+            rx: std::sync::Arc::new(std::sync::Mutex::new(ExecStreamReceiver {
+                rx,
+                decoder: Utf8ExecStream::default(),
+                done: false,
+            })),
             cancel,
         }
     }
@@ -760,7 +799,19 @@ impl NapiMachine {
         .map_err(join_error)?
         .into_napi()?;
 
-        Ok(events.into_iter().map(ExecStreamEvent::from).collect())
+        let mut decoder = Utf8ExecStream::default();
+        let mut decoded = Vec::new();
+        for event in events {
+            decoder.push(event);
+            while let Some(event) = decoder.pop() {
+                decoded.push(event.into());
+            }
+        }
+        decoder.finish();
+        while let Some(event) = decoder.pop() {
+            decoded.push(event.into());
+        }
+        Ok(decoded)
     }
 
     /// Copy guest-local staged mounts back to their host sources.

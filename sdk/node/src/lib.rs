@@ -15,6 +15,8 @@
 
 #[path = "errors.rs"]
 pub mod error;
+#[path = "../../shared/exec_stream_utf8.rs"]
+mod exec_stream_utf8;
 pub mod machine;
 pub mod types;
 

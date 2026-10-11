@@ -75,6 +75,15 @@ async function main(): Promise<void> {
     check('stream saw exit event', sawExit);
     check('stream captured stdout', streamedOut.includes('line1') && streamedOut.includes('line2'));
 
+    // Guest writes can split one UTF-8 code point across several agent frames.
+    let unicodeOut = '';
+    for await (const ev of machine.execStream(['sh', '-c',
+      "printf '\\360'; sleep 0.2; printf '\\237'; sleep 0.2; printf '\\220\\261\\n'",
+    ])) {
+      if (ev.kind === 'stdout') unicodeOut += ev.data;
+    }
+    check('stream keeps split Unicode intact', unicodeOut === '🐱\n', JSON.stringify(unicodeOut));
+
     // 6) images are listable (we pulled one in step 2)
     const images = await machine.listImages();
     check('listImages returns the pulled image', images.some((i) => i.reference.includes('python')));
