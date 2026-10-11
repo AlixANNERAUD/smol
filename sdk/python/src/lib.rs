@@ -452,7 +452,19 @@ impl Machine {
             _ => false,
         };
         let image: Option<String> = match config.get_item("image")? {
-            Some(v) if !v.is_none() => Some(v.extract()?),
+            Some(v) if !v.is_none() => {
+                let image: String = v.extract()?;
+                Some(
+                    py.allow_threads(|| {
+                        use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+                        resolve(classify(&image)).map(|resolved| match resolved {
+                            ResolvedImage::Registry(reference)
+                            | ResolvedImage::Local { reference, .. } => reference,
+                        })
+                    })
+                    .map_err(err)?,
+                )
+            }
             _ => None,
         };
 

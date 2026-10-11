@@ -287,6 +287,11 @@ export declare class NapiMachine {
    * for a failed boot. Never throws.
    */
   static checkHost(): HostAvailability
+  /**
+   * Stage a local archive or rootfs directory before creating the machine.
+   * Large archives are hashed off the JavaScript event loop.
+   */
+  static prepareImage(image: string): Promise<string>
   /** Create a new machine. Does not start the VM yet — call `start()`. */
   constructor(config: MachineConfig)
   /**

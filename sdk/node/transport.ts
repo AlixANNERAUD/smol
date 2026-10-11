@@ -2067,6 +2067,9 @@ export async function makeTransport(
     // Validate the config before loading the engine, so a config the local
     // target cannot honour fails the same way whether or not it is installed.
     const nativeConfig = toNativeConfig(name, config);
+    if (nativeConfig.image) {
+      nativeConfig.image = await getNapiMachine().prepareImage(nativeConfig.image);
+    }
     const inner = new (getNapiMachine())(nativeConfig);
     // A detached machine is nobody's to stop on a signal — it was created to
     // survive this process — and its branches inherit that.

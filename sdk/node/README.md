@@ -87,6 +87,27 @@ try {
 }
 ```
 
+Local machines also accept a saved Docker/OCI image archive or an unpacked rootfs
+as `image`. The SDK stages an archive once and reuses its content hash; a
+missing local path fails immediately with the path in the error instead of
+trying to pull it from a registry. Build your image first, then save it:
+
+```sh
+docker save my-agent:latest -o my-agent.tar
+```
+
+```ts
+const m = await Machine.create(
+  { image: './my-agent.tar', network: false },
+  { target: 'local' },
+);
+try {
+  console.log((await m.exec(['sh', '-c', 'pwd'])).stdout);
+} finally {
+  await m.delete();
+}
+```
+
 For a local VM whose published service starts through `exec()`, set
 `waitForPorts: false` on creation. The SDK still waits for the guest agent,
 so `exec()` is safe; call `waitUntilReady()` once the service is listening.

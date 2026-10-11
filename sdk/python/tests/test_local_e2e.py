@@ -7,7 +7,9 @@ if the native ext isn't available.
 """
 
 import asyncio
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -91,6 +93,29 @@ def main() -> int:
         check("list_images includes python", any("python" in i.reference for i in imgs))
     finally:
         m.delete()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        missing_archive = str(Path(tmp) / "missing.tar")
+        try:
+            Machine.create(MachineConfig(image=missing_archive))
+        except Exception as exc:
+            check(
+                "missing local archive fails before any registry pull",
+                "cannot read archive" in str(exc) and "crane" not in str(exc),
+                str(exc),
+            )
+        else:
+            check("missing local archive is refused", False)
+
+    if image_archive := os.environ.get("SMOL_SDK_TEST_IMAGE_ARCHIVE"):
+        local_image = Machine.create(
+            MachineConfig(image=image_archive, resources=ResourceSpec(cpus=2, memory_mb=1024))
+        )
+        try:
+            result = local_image.exec(["sh", "-c", "printf archive-ready"])
+            check("local image archive boots without registry pull", result.stdout == "archive-ready")
+        finally:
+            local_image.delete()
 
     elapsed, results = asyncio.run(concurrent_exec_probe())
     check("concurrent execs exit 0", all(result.exit_code == 0 for result in results))
