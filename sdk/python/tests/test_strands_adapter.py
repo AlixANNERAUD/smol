@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 from contextlib import aclosing
 from unittest.mock import Mock, patch
@@ -160,6 +161,9 @@ def test_cloud_default_expires_if_caller_exits_and_invalid_env_does_not_boot_vm(
                     ValueError, match="Invalid environment variable name"
                 ):
                     await sandbox.execute("true", env={"FOO=x": "wrong"})
+                for timeout in (0, math.inf, math.nan):
+                    with pytest.raises(ValueError, match="positive and finite"):
+                        await sandbox.execute("true", timeout=timeout)
                 create.assert_not_called()
                 assert (await sandbox.execute("true")).exit_code == 0
                 assert create.call_args.args[0].ttl_seconds == 3600
@@ -225,6 +229,35 @@ def test_host_deadline_stops_a_blocked_command_and_preserves_partial_output():
                 await sandbox.execute("sleep 10", timeout=0.05)
             assert error.value.stdout == "before"
             assert blocked.is_set() and stopped.is_set()
+            assert machine.exec_stream.call_args.args[1].timeout == 2
+
+    asyncio.run(exercise())
+
+
+def test_host_deadline_covers_slow_stream_open_and_closes_late_command():
+    async def exercise():
+        opening = threading.Event()
+        release = threading.Event()
+        stream = Events([{"kind": "exit", "exit_code": 0}])
+
+        def delayed_open(*args):
+            opening.set()
+            assert release.wait(3)
+            return stream
+
+        machine = Mock()
+        machine.exec_stream.side_effect = delayed_open
+        async with SmolSandbox(machine=machine) as sandbox:
+            with pytest.raises(SandboxTimeoutError) as error:
+                await sandbox.execute("sleep 10", timeout=0.05)
+            assert (error.value.stdout, error.value.stderr) == ("", "")
+            assert opening.is_set()
+            release.set()
+            for _ in range(100):
+                if stream.closed:
+                    break
+                await asyncio.sleep(0.01)
+            assert stream.closed, "a late stream must not leave a command running"
 
     asyncio.run(exercise())
 

@@ -7,6 +7,7 @@ The sandbox owns machines it creates; an injected machine stays caller-owned.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from collections.abc import AsyncGenerator
@@ -101,8 +102,8 @@ class SmolSandbox(PosixShellSandbox):
         **kwargs: Any,
     ) -> AsyncGenerator[StreamChunk | ExecutionResult, None]:
         """Stream distinct stdout/stderr events and return the command's exit code."""
-        if timeout is not None and timeout <= 0:
-            raise ValueError("timeout must be positive")
+        if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError("timeout must be positive and finite")
         if env:
             validate_env_keys(env)
         machine = await asyncio.to_thread(self._get_machine)
@@ -111,11 +112,25 @@ class SmolSandbox(PosixShellSandbox):
             asyncio.to_thread(
                 machine.exec_stream,
                 ["sh", "-c", command],
-                ExecOptions(workdir=cwd or self.working_dir, timeout=timeout, env=env),
+                # The host deadline reports Strands' typed timeout and preserves
+                # partial output. Keep the guest deadline as a safety backstop.
+                ExecOptions(
+                    workdir=cwd or self.working_dir,
+                    timeout=math.ceil(timeout) + 1 if timeout is not None else None,
+                    env=env,
+                ),
             )
         )
         try:
-            stream = await asyncio.shield(opening)
+            if deadline is None:
+                stream = await asyncio.shield(opening)
+            else:
+                stream = await asyncio.wait_for(
+                    asyncio.shield(opening), max(0, deadline - time.monotonic())
+                )
+        except TimeoutError as exc:
+            opening.add_done_callback(_close_after_open)
+            raise SandboxTimeoutError(timeout, "", "") from exc
         except BaseException:
             # Cancelling a thread wait does not stop the thread: close its stream
             # when it eventually returns, so the command cannot run unseen.
