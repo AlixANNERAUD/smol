@@ -22,6 +22,10 @@ use smolvm::agent::ExecEvent;
 use smolvm::embedded::{runtime, ExecCancel, ExecOptions, ForkSourcePolicy, MachineSpec};
 use smolvm::error::{AgentErrorKind, Error as SmolvmError};
 
+#[path = "../../shared/exec_stream_utf8.rs"]
+mod exec_stream_utf8;
+use exec_stream_utf8::Utf8ExecStream;
+
 // Error codes exposed to Python as `SmolError.code` (parity with smol-node's
 // `errors.rs`). The pure-Python `wrap_native_error` parses the `[CODE]` prefix.
 const NOT_FOUND: &str = "NOT_FOUND";
@@ -250,8 +254,34 @@ fn exec_event_to_dict(py: Python<'_>, ev: ExecEvent) -> PyResult<Py<PyDict>> {
 #[pyclass]
 struct ExecStream {
     // Mutex makes `&Receiver` Send so __next__ can recv inside `allow_threads`.
-    rx: std::sync::Mutex<std::sync::mpsc::Receiver<ExecEvent>>,
+    rx: std::sync::Mutex<ExecStreamReceiver>,
     cancel: ExecCancel,
+}
+
+struct ExecStreamReceiver {
+    rx: std::sync::mpsc::Receiver<ExecEvent>,
+    decoder: Utf8ExecStream,
+    done: bool,
+}
+
+impl ExecStreamReceiver {
+    fn next(&mut self) -> Option<ExecEvent> {
+        loop {
+            if let Some(event) = self.decoder.pop() {
+                return Some(event);
+            }
+            if self.done {
+                return None;
+            }
+            match self.rx.recv() {
+                Ok(event) => self.decoder.push(event),
+                Err(_) => {
+                    self.done = true;
+                    self.decoder.finish();
+                }
+            }
+        }
+    }
 }
 
 fn source_policy(freeze_source: bool) -> ForkSourcePolicy {
@@ -272,13 +302,13 @@ impl ExecStream {
         if self.cancel.is_cancelled() {
             return Ok(None);
         }
-        let received = py.allow_threads(|| self.rx.lock().expect("exec stream lock").recv());
+        let received = py.allow_threads(|| self.rx.lock().expect("exec stream lock").next());
         match received {
             // A kill that raced this event wins: what the teardown produced is
             // not the command's output.
-            Ok(_) if self.cancel.is_cancelled() => Ok(None),
-            Ok(ev) => Ok(Some(exec_event_to_dict(py, ev)?)),
-            Err(_) => Ok(None), // channel closed → command finished → StopIteration
+            Some(_) if self.cancel.is_cancelled() => Ok(None),
+            Some(ev) => Ok(Some(exec_event_to_dict(py, ev)?)),
+            None => Ok(None), // channel closed → command finished → StopIteration
         }
     }
 
@@ -1010,7 +1040,11 @@ impl Machine {
         let (tx, rx) = std::sync::mpsc::channel::<ExecEvent>();
         spawn_exec_stream(self.name.clone(), command, opts, cancel.clone(), tx);
         Ok(ExecStream {
-            rx: std::sync::Mutex::new(rx),
+            rx: std::sync::Mutex::new(ExecStreamReceiver {
+                rx,
+                decoder: Utf8ExecStream::default(),
+                done: false,
+            }),
             cancel,
         })
     }
