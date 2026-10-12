@@ -294,6 +294,37 @@ merely reusing image layers. The initial implementation supports Linux
 single-container tasks with a published `docker_image`; Docker Compose and
 Dockerfile-only tasks fail clearly instead of silently changing semantics.
 
+### Ray Sandboxes backend
+
+Run `ray.experimental.sandbox` (Ray 2.58+) on smol machines instead of gVisor
+containers. Each sandbox gets its own Linux kernel, so io_uring, eBPF, perf and
+overlayfs/cgroup2 mounts (Docker inside a sandbox) work:
+
+```bash
+pip install 'smolmachines[ray]'
+```
+
+```python
+import ray
+from ray.experimental import sandbox
+from smol import ray_sandbox
+
+ray.init(runtime_env=ray_sandbox.use_smol())        # use_smol("cloud") without /dev/kvm
+sb = sandbox.create(image="python:3.12-slim", cpu=0, workdir="/workspace")
+ray.get(sb.exec.remote("python3 -V"))
+children = ray_sandbox.branch(sb, 20)               # live copy-on-write branches
+```
+
+`use_smol()` swaps in a `Sandbox` actor that builds its runtime on smol, so the
+rest of the code is unchanged Ray. `ray_sandbox.branch` branches a running
+sandbox, warm processes included, into new `Sandbox` actors in one batch, with
+no checkpoint written. With Ray's checkpoint/restore API
+([ray-project/ray#66471](https://github.com/ray-project/ray/pull/66471)),
+`checkpoint`, `sandbox.restore`, `pause` and `resume` work too. A local
+checkpoint bundle holds the portable artifact; a cloud one names a durable
+cloud checkpoint. Ray workers need `smolmachines` installed, as for any Ray
+dependency; `RAY_SANDBOX_SMOL_TARGET=cloud` selects Smol Cloud in every process.
+
 ## Architecture
 - **Pure-Python layer** (`python/smol`): `Machine`, transports, types, errors —
   zero third-party deps (the cloud transport uses only `urllib`).

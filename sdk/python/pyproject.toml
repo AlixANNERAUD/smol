@@ -44,12 +44,17 @@ verifiers = ["verifiers>=0.2"]
 nemo-gym = ["nemo-gym>=0.5.0"]
 # Use SmolVM as a Harbor evaluation environment: `pip install smolmachines[harbor]`.
 harbor = ["harbor>=0.22,<0.23"]
+# Use smol machines as Ray Sandboxes: `pip install smolmachines[ray]`.
+ray = ["ray>=2.58"]
 
 [project.entry-points."nemo_gym.sandbox_providers"]
 smol = "smol.nemo_gym:SmolProvider"
 
 [project.entry-points."harbor.environments"]
 smol = "smol.harbor:SmolEnvironment"
+
+[project.entry-points."ray.sandbox_backends"]
+smol = "smol.ray_sandbox:SmolSandboxBackend"
 
 [tool.maturin]
 # Mixed Rust/Python layout: pure-Python package lives in python/smol, the native
