@@ -28,6 +28,8 @@ versions["crates/smol-cloud/Cargo.toml"]=$(extract "crates/smol-cloud/Cargo.toml
 versions["sdk/rust/Cargo.toml:smol-cloud"]=$(extract "sdk/rust/Cargo.toml" '^smol-cloud =')
 versions["sdk/node/package-lock.json"]=$(extract "sdk/node/package-lock.json" '"version"[[:space:]]*:')
 versions["sdk/node/package-lock.json:root"]=$(perl -0777 -ne 'print $1 if /"packages":\s*\{\s*"":\s*\{[^}]*"version":\s*"([^"]+)"/' sdk/node/package-lock.json)
+versions["sdk/mcp/package.json"]=$(extract "sdk/mcp/package.json" '"version"[[:space:]]*:')
+versions["sdk/mcp/package-lock.json:root"]=$(perl -0777 -ne 'print $1 if /"packages":\s*\{\s*"":\s*\{[^}]*"version":\s*"([^"]+)"/' sdk/mcp/package-lock.json)
 
 for entry in 'Cargo.lock:smol-cli' 'Cargo.lock:smol-cloud' 'sdk/node/Cargo.lock:smol-node' 'sdk/python/Cargo.lock:smol-py' 'sdk/rust/Cargo.lock:smolmachines' 'sdk/rust/Cargo.lock:smol-cloud'; do
     versions["$entry"]=$(awk -v name="${entry##*:}" '
