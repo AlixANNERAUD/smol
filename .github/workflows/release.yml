@@ -317,6 +317,47 @@ jobs:
           for d in npm-packages/*/; do publish "${d%/}"; done
           publish .
 
+  # ─── MCP server: pure TypeScript over the published SDK ────────────────────
+  # smolmachines-mcp depends on smolmachines@^<version>, so it publishes after
+  # the SDK: a fresh `npx -y smolmachines-mcp` must never resolve to an SDK
+  # version that is not on npm yet. Same OIDC trusted publishing as node-publish;
+  # the package needs its Trusted Publisher (this repo + release.yml) configured
+  # on npmjs.com, which npm only allows once the package exists — the very first
+  # version is published by hand from sdk/mcp.
+  mcp-publish:
+    name: mcp · publish to npm
+    needs: node-publish
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: sdk/mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+          cache-dependency-path: sdk/mcp/package-lock.json
+      - run: npm install -g npm@11
+      - run: npm ci
+      - run: npm run build
+      - name: Publish to npm
+        # Skips a version already on npm so a re-run of a half-published release
+        # stays green, matching node-publish.
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          ver="$(node -p "require('./package.json').version")"
+          if npm view "$name@$ver" version >/dev/null 2>&1; then
+            echo "$name@$ver already published to npm — skipping"
+          else
+            npm publish --access public --provenance
+          fi
+
   # ─── Python: abi3 wheels (one per platform, Py3.9+) ────────────────────────
   python-wheels:
     name: py · wheel ${{ matrix.target }}
