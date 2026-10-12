@@ -21,10 +21,11 @@ import { Machine } from "smolmachines";
 import type { ConnectOptions, MachineConfig } from "smolmachines";
 import { spawn } from "node:child_process";
 import { mkdir, stat } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import path from "node:path";
 
-const VERSION = "1.26.1";
+const { version: VERSION } = createRequire(import.meta.url)("../package.json") as { version: string };
 
 /** Text returned per stream before it is cut; the full output stays in the machine. */
 const OUTPUT_CAP = 64 * 1024;
@@ -110,6 +111,9 @@ function host(
 }
 
 const sh = (script: string) => ["sh", "-lc", script];
+/** Single-quote a value for the guest shell so agent-supplied paths cannot break out. */
+const q = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Copy a host directory into the machine as a tarball the guest unpacks. */
 async function copyIn(m: Machine, hostDir: string, guestDir: string, exclude: string[]) {
@@ -120,7 +124,7 @@ async function copyIn(m: Machine, hostDir: string, guestDir: string, exclude: st
   if (tar.code !== 0) throw new Error(`tar on host failed: ${tar.stderr}`);
   await m.writeFile("/tmp/.smol-workspace.tgz", tar.stdout);
   const unpack = await m.exec(
-    sh(`mkdir -p '${guestDir}' && tar -xzf /tmp/.smol-workspace.tgz -C '${guestDir}' && rm -f /tmp/.smol-workspace.tgz`),
+    sh(`mkdir -p ${q(guestDir)} && tar -xzf /tmp/.smol-workspace.tgz -C ${q(guestDir)} && rm -f /tmp/.smol-workspace.tgz`),
     { timeout: 600 },
   );
   if (unpack.exitCode !== 0) throw new Error(`unpack in machine failed: ${unpack.stderr}`);
@@ -195,8 +199,10 @@ server.registerTool(
       let copied: number | undefined;
       if (args.workspace) copied = await copyIn(m, args.workspace, args.workspaceTarget, args.exclude);
       if (args.env) {
+        const bad = Object.keys(args.env).find((key) => !ENV_KEY.test(key));
+        if (bad) throw new Error(`env key is not a POSIX variable name: ${bad}`);
         const lines = Object.entries(args.env)
-          .map(([key, value]) => `export ${key}=${JSON.stringify(value)}`)
+          .map(([key, value]) => `export ${key}=${q(value)}`)
           .join("\n");
         await m.writeFile("/etc/profile.d/smol-mcp.sh", `${lines}\n`, 0o644);
       }
@@ -380,7 +386,7 @@ server.registerTool(
   async (args) => {
     try {
       const m = await machine(args.machine);
-      await m.exec(sh(`mkdir -p '${path.posix.dirname(args.path)}'`));
+      await m.exec(sh(`mkdir -p ${q(path.posix.dirname(args.path))}`));
       await m.writeFile(args.path, args.content, args.mode);
       return text({ machine: args.machine, path: args.path, bytes: Buffer.byteLength(args.content) });
     } catch (error) {
@@ -407,8 +413,8 @@ server.registerTool(
       await mkdir(args.hostPath, { recursive: true });
       const parent = path.posix.dirname(args.guestPath);
       const base = path.posix.basename(args.guestPath);
-      const isDir = (await m.exec(sh(`test -d '${args.guestPath}'`))).exitCode === 0;
-      const tarSpec = isDir ? `-C '${args.guestPath}' .` : `-C '${parent}' '${base}'`;
+      const isDir = (await m.exec(sh(`test -d ${q(args.guestPath)}`))).exitCode === 0;
+      const tarSpec = isDir ? `-C ${q(args.guestPath)} .` : `-C ${q(parent)} ${q(base)}`;
       const result = await m.exec(sh(`tar -czf - ${tarSpec} | base64 | tr -d '\\n'`), { timeout: 600 });
       if (result.exitCode !== 0) throw new Error(`tar in machine failed: ${result.stderr}`);
       const archive = Buffer.from(result.stdout, "base64");
