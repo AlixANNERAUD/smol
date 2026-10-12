@@ -13,8 +13,8 @@ use serde::de::DeserializeOwned;
 use crate::credentials::Credentials;
 use crate::error::{Error, ErrorKind, Result};
 use crate::types::{
-    BranchBatch, Checkpoint, CheckpointUpload, Command, CommandOutput, CreateMachine, Machine,
-    MachineCacheDisk, Network, Port, SetCredential, Share, Usage,
+    BranchBatch, Checkpoint, CheckpointUpload, Command, CommandOutput, CreateMachine, JobOutput,
+    JobRequest, Machine, MachineCacheDisk, MachineJob, Network, Port, SetCredential, Share, Usage,
 };
 
 /// Ordinary calls are short: a hung request must not block a caller forever.
@@ -989,6 +989,113 @@ impl Client {
         )
     }
 
+    // -- jobs --------------------------------------------------------------
+
+    /// Start a detached job and return at once. Never resent on a 5xx: the
+    /// job may already be running.
+    pub fn start_job(&self, id: &str, request: &JobRequest) -> Result<MachineJob> {
+        self.json(
+            reqwest::Method::POST,
+            &format!("/v1/machines/{id}/jobs"),
+            Body::Json(serde_json::to_value(request).map_err(serialize_error)?),
+            START_TIMEOUT,
+        )
+    }
+
+    /// A machine's jobs, newest first, as last recorded.
+    pub fn jobs(&self, id: &str) -> Result<Vec<MachineJob>> {
+        let list: crate::types::JobList = self.json(
+            reqwest::Method::GET,
+            &format!("/v1/machines/{id}/jobs"),
+            Body::None,
+            REQUEST_TIMEOUT,
+        )?;
+        Ok(list.jobs)
+    }
+
+    /// One job's live state.
+    pub fn job(&self, id: &str, job_id: &str) -> Result<MachineJob> {
+        self.json(
+            reqwest::Method::GET,
+            &format!("/v1/machines/{id}/jobs/{}", encode_path(job_id)),
+            Body::None,
+            REQUEST_TIMEOUT,
+        )
+    }
+
+    /// A slice of a job's `stdout` or `stderr` from `offset`; `limit: None`
+    /// takes the server default (256 KiB, at most 1 MiB).
+    pub fn job_output(
+        &self,
+        id: &str,
+        job_id: &str,
+        stream: &str,
+        offset: u64,
+        limit: Option<u64>,
+    ) -> Result<JobOutput> {
+        let mut path = format!(
+            "/v1/machines/{id}/jobs/{}/output?stream={stream}&offset={offset}",
+            encode_path(job_id)
+        );
+        if let Some(limit) = limit {
+            path.push_str(&format!("&limit={limit}"));
+        }
+        self.json(reqwest::Method::GET, &path, Body::None, REQUEST_TIMEOUT)
+    }
+
+    /// Everything a job has written to `stream` so far; on a finished job,
+    /// all of it.
+    pub fn job_output_all(&self, id: &str, job_id: &str, stream: &str) -> Result<Vec<u8>> {
+        let mut all = Vec::new();
+        let mut offset = 0;
+        loop {
+            let slice = self.job_output(id, job_id, stream, offset, Some(1024 * 1024))?;
+            let bytes = slice.bytes();
+            all.extend_from_slice(&bytes);
+            offset = slice.next_offset;
+            if slice.eof || bytes.is_empty() {
+                return Ok(all);
+            }
+        }
+    }
+
+    /// Stop a job with SIGTERM; it is recorded as exited 143.
+    pub fn cancel_job(&self, id: &str, job_id: &str) -> Result<MachineJob> {
+        self.json(
+            reqwest::Method::POST,
+            &format!("/v1/machines/{id}/jobs/{}/cancel", encode_path(job_id)),
+            Body::None,
+            REQUEST_TIMEOUT,
+        )
+    }
+
+    /// Poll until a job is no longer running and return its final state.
+    /// Fails with [`ErrorKind::Timeout`] after `timeout`; the job keeps
+    /// running.
+    pub fn wait_job(
+        &self,
+        id: &str,
+        job_id: &str,
+        timeout: Duration,
+        interval: Duration,
+    ) -> Result<MachineJob> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let job = self.job(id, job_id)?;
+            if !job.is_running() {
+                return Ok(job);
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(Error::new(
+                    ErrorKind::Timeout,
+                    format!("job {job_id} still running after {timeout:?}"),
+                ));
+            }
+            std::thread::sleep(interval.min(left));
+        }
+    }
+
     // -- account -----------------------------------------------------------
 
     /// Metered usage and cost for a machine.
@@ -1149,7 +1256,7 @@ fn sdk_may_retry(status: u16, method: &reqwest::Method, path: &str) -> bool {
         | reqwest::Method::DELETE => true,
         reqwest::Method::POST => {
             let route = path.split('?').next().unwrap_or(path);
-            ["/start", "/stop", "/resume"]
+            ["/start", "/stop", "/resume", "/cancel"]
                 .iter()
                 .any(|lifecycle| route.ends_with(lifecycle))
         }
@@ -1532,6 +1639,96 @@ mod tests {
         "retry-after: 0\r\n",
         r#"{"status":503,"code":"unavailable","detail":"node restarting","retryable":true}"#,
     );
+
+    const JOB_RUNNING: (&str, &str, &str) = (
+        "200 OK",
+        "",
+        r#"{"id":"j1","machineId":"mach-x","command":["make"],"state":"running","createdAt":"t0"}"#,
+    );
+
+    #[test]
+    fn a_job_is_polled_until_it_exits_and_its_output_read_to_eof() {
+        let (url, seen) = scripted_server(vec![
+            ("202 Accepted", "", JOB_RUNNING.2),
+            JOB_RUNNING,
+            (
+                "200 OK",
+                "",
+                r#"{"id":"j1","machineId":"mach-x","command":["make"],"state":"exited","exitCode":2,"createdAt":"t0","finishedAt":"t1"}"#,
+            ),
+            // "ok\n" then the byte 0xff, which only the base64 field carries.
+            (
+                "200 OK",
+                "",
+                r#"{"stream":"stdout","offset":0,"nextOffset":3,"data":"ok\n","dataB64":"b2sK","eof":false}"#,
+            ),
+            (
+                "200 OK",
+                "",
+                r#"{"stream":"stdout","offset":3,"nextOffset":4,"data":"\ufffd","dataB64":"/w==","eof":true}"#,
+            ),
+        ]);
+        let client = Client::new(Credentials::new(&url, "smk_test")).unwrap();
+        let job = client
+            .start_job(
+                "mach-x",
+                &JobRequest {
+                    command: vec!["make".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(job.is_running());
+        let done = client
+            .wait_job(
+                "mach-x",
+                &job.id,
+                Duration::from_secs(5),
+                Duration::from_millis(1),
+            )
+            .unwrap();
+        assert_eq!((done.state.as_str(), done.exit_code), ("exited", Some(2)));
+        let out = client.job_output_all("mach-x", &job.id, "stdout").unwrap();
+        assert_eq!(out, b"ok\n\xff");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn a_job_start_is_not_resent_but_a_cancel_is() {
+        let (url, seen) = scripted_server(vec![UNAVAILABLE]);
+        let client = Client::new(Credentials::new(&url, "smk_test")).unwrap();
+        let error = client
+            .start_job(
+                "mach-x",
+                &JobRequest {
+                    command: vec!["make".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.retryable());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let (url, seen) = scripted_server(vec![UNAVAILABLE, ("202 Accepted", "", JOB_RUNNING.2)]);
+        let client = Client::new(Credentials::new(&url, "smk_test")).unwrap();
+        client.cancel_job("mach-x", "j1").unwrap();
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn waiting_on_a_job_gives_up_with_a_timeout() {
+        let (url, _) = scripted_server(vec![JOB_RUNNING]);
+        let client = Client::new(Credentials::new(&url, "smk_test")).unwrap();
+        let error = client
+            .wait_job(
+                "mach-x",
+                "j1",
+                Duration::from_millis(5),
+                Duration::from_millis(1),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+    }
 
     #[test]
     fn a_read_retries_through_brief_unavailability() {

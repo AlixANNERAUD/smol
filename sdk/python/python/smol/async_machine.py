@@ -29,8 +29,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any, AsyncIterator, Optional
 
-from .machine import Machine
+from .machine import Job, Machine
 from .types import (
+    JobInfo,
+    JobOutput,
     MachineSummary,
     CacheDiskRef,
     PublishedCacheDisk,
@@ -178,6 +180,29 @@ class AsyncMachine:
     async def export_artifact(self) -> dict:
         """Export this stopped machine as a ``.smolmachine``. Cloud only."""
         return await asyncio.to_thread(self._m.export_artifact)
+
+    async def start_job(
+        self,
+        command: "list[str] | str",
+        *,
+        workdir: Optional[str] = None,
+        env: Optional[dict] = None,
+        timeout: Optional[int] = None,
+        user: Optional[str] = None,
+    ) -> "AsyncJob":
+        """Start a detached job (see :meth:`Machine.start_job`). Cloud only."""
+        job = await asyncio.to_thread(
+            lambda: self._m.start_job(command, workdir=workdir, env=env, timeout=timeout, user=user)
+        )
+        return AsyncJob(job)
+
+    async def jobs(self) -> "list[JobInfo]":
+        """This machine's jobs, newest first. Cloud only."""
+        return await asyncio.to_thread(self._m.jobs)
+
+    def job(self, job_id: str) -> "AsyncJob":
+        """A handle to an existing job by id. Makes no request. Cloud only."""
+        return AsyncJob(self._m.job(job_id))
 
     async def ready(self) -> bool:
         """Whether the machine is READY to do work (see :meth:`Machine.ready`)."""
@@ -473,6 +498,47 @@ class AsyncMachine:
 
     async def __aexit__(self, *exc: object) -> None:
         await self.delete()
+
+
+class AsyncJob:
+    """Async view of a detached job (see :class:`smol.Job`)."""
+
+    def __init__(self, job: Job) -> None:
+        self._j = job
+
+    @property
+    def id(self) -> str:
+        return self._j.id
+
+    async def info(self) -> JobInfo:
+        return await asyncio.to_thread(self._j.info)
+
+    async def output(self, *, stream: str = "stdout", offset: int = 0, limit: Optional[int] = None) -> JobOutput:
+        return await asyncio.to_thread(lambda: self._j.output(stream=stream, offset=offset, limit=limit))
+
+    async def read_all(self, stream: str = "stdout") -> bytes:
+        return await asyncio.to_thread(self._j.read_all, stream)
+
+    async def cancel(self) -> JobInfo:
+        return await asyncio.to_thread(self._j.cancel)
+
+    async def wait(self, *, poll_s: float = 1.0, timeout_s: Optional[float] = None) -> JobInfo:
+        """Poll until the job is no longer running, sleeping on the event loop
+        between polls rather than in a thread."""
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout_s is None else loop.time() + timeout_s
+        while True:
+            info = await self.info()
+            if info.state != "running":
+                return info
+            delay = poll_s
+            if deadline is not None:
+                left = deadline - loop.time()
+                if left <= 0:
+                    from .errors import SmolError
+                    raise SmolError("TIMEOUT", f"job {self.id} still running after {timeout_s:g}s")
+                delay = min(poll_s, left)
+            await asyncio.sleep(delay)
 
 
 class AsyncEpisode:

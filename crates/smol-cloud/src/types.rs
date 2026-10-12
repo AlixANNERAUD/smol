@@ -404,6 +404,96 @@ fn decode(b64: Option<&str>, text: Option<&str>) -> Vec<u8> {
         .unwrap_or_else(|| text.unwrap_or_default().as_bytes().to_vec())
 }
 
+/// A command to start as a detached job: its output and exit code stay in the
+/// machine, so the caller can disconnect and poll for it by id.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRequest {
+    /// argv, not a shell string.
+    pub command: Vec<String>,
+    /// Extra environment for the job.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Working directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Stop the job with SIGTERM after this many seconds; it then exits 143.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+    /// Run as this user (a name from the image or a numeric `uid[:gid]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// A detached job and what is known about it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineJob {
+    /// Job id.
+    pub id: String,
+    /// The machine it runs in.
+    pub machine_id: String,
+    /// The command as it was run (argv).
+    pub command: Vec<String>,
+    /// `running`, `exited` (see `exit_code`), or `lost`: the machine stopped
+    /// or restarted while the job ran, so it never finished.
+    pub state: String,
+    /// The exit code once `exited`; 143 when cancelled or timed out.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// When the job started.
+    pub created_at: String,
+    /// When the job finished.
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    /// Bytes of stdout written so far, when the machine was asked.
+    #[serde(default)]
+    pub stdout_bytes: Option<u64>,
+    /// Bytes of stderr written so far, when the machine was asked.
+    #[serde(default)]
+    pub stderr_bytes: Option<u64>,
+}
+
+impl MachineJob {
+    /// Whether the job is still running.
+    pub fn is_running(&self) -> bool {
+        self.state == "running"
+    }
+}
+
+/// A slice of a job's stdout or stderr.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobOutput {
+    /// `stdout` or `stderr`.
+    pub stream: String,
+    /// Byte offset this slice starts at.
+    pub offset: u64,
+    /// Byte offset to read from next.
+    pub next_offset: u64,
+    /// The slice as lossy UTF-8.
+    #[serde(default)]
+    pub data: String,
+    /// The slice, byte-exact (base64).
+    #[serde(default)]
+    pub data_b64: Option<String>,
+    /// True once the job has finished and this slice reaches the end of the
+    /// stream: nothing more will be written.
+    pub eof: bool,
+}
+
+impl JobOutput {
+    /// The slice as bytes, preferring the byte-exact field.
+    pub fn bytes(&self) -> Vec<u8> {
+        decode(self.data_b64.as_deref(), Some(&self.data))
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct JobList {
+    pub(crate) jobs: Vec<MachineJob>,
+}
+
 /// A stored capture of a machine.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

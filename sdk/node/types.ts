@@ -632,3 +632,72 @@ export interface PublishedCacheDisk {
   cacheDisk: CacheDiskInfo;
   version: CacheDiskVersion;
 }
+
+/** Options for {@link Machine.startJob}. Cloud only. */
+export interface JobOptions {
+  /** Environment variables. */
+  env?: Record<string, string>;
+  /** Working directory inside the machine. */
+  workdir?: string;
+  /** Stop the job with SIGTERM after this many **seconds**; it then exits 143. */
+  timeout?: number;
+  /** Run the job as this user: a name from the image or a numeric `uid[:gid]`. */
+  user?: string;
+}
+
+/** `running`; `exited` (see `exitCode`); or `lost`, when the machine stopped or
+ *  restarted while the job ran, so it never finished. */
+export type JobState = "running" | "exited" | "lost";
+
+/** A job and what is known about it. */
+export interface JobInfo {
+  id: string;
+  machineId: string;
+  /** The command as it was run (argv). */
+  command: string[];
+  state: JobState;
+  /** Set once `exited`; 143 when the job was cancelled or hit its timeout. */
+  exitCode?: number;
+  createdAt: string;
+  finishedAt?: string;
+  /** Bytes of stdout written so far, when the machine was asked. */
+  stdoutBytes?: number;
+  /** Bytes of stderr written so far, when the machine was asked. */
+  stderrBytes?: number;
+}
+
+/** Which slice of a job's output to read. */
+export interface JobOutputOptions {
+  /** Default `"stdout"`. */
+  stream?: "stdout" | "stderr";
+  /** Byte offset to start at. Default 0. */
+  offset?: number;
+  /** Most bytes to return. The server defaults to 256 KiB and caps at 1 MiB. */
+  limit?: number;
+}
+
+/** A slice of a job's stdout or stderr. */
+export interface JobOutput {
+  stream: "stdout" | "stderr";
+  /** Byte offset this slice starts at. */
+  offset: number;
+  /** Byte offset to read from next. */
+  nextOffset: number;
+  /** The slice, byte-exact. */
+  data: Buffer;
+  /** The slice as lossy UTF-8. */
+  text: string;
+  /** True once the job has finished and this slice reaches the end of the
+   *  stream: nothing more will be written. */
+  eof: boolean;
+}
+
+/** How {@link Job.wait} polls. */
+export interface JobWaitOptions {
+  /** Delay between polls. Default 1000 ms. */
+  pollMs?: number;
+  /** Give up with a `TIMEOUT` error after this long. Default: wait forever. */
+  timeoutMs?: number;
+  /** Stop waiting; rejects with `signal.reason`. The job keeps running. */
+  signal?: AbortSignal;
+}

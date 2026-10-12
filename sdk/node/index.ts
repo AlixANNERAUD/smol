@@ -17,7 +17,7 @@
  * cloud — same API, backend selected via ConnectOptions / SMOL_CLOUD_TOKEN.
  */
 
-export { Machine, Episode, CacheDisk } from './machine';
+export { Machine, Episode, CacheDisk, Job } from './machine';
 export { RolloutClient, RolloutError, adapterSha256 } from './rollout';
 export type {
   BuildRolloutJobOptions,
@@ -58,6 +58,12 @@ export type {
   ForkBatchOptions,
   AssignOptions,
   ExecOptions,
+  JobInfo,
+  JobOptions,
+  JobOutput,
+  JobOutputOptions,
+  JobState,
+  JobWaitOptions,
   ExecResult,
   MachineUsageReport,
   ShareLink,

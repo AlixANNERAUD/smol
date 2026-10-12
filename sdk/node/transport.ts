@@ -29,6 +29,10 @@ import {
 } from "./errors";
 import type {
   CheckpointOptions,
+  JobInfo,
+  JobOptions,
+  JobOutput,
+  JobOutputOptions,
   CacheDiskInfo,
   CacheDiskRef,
   CreateCacheDiskOptions,
@@ -119,6 +123,16 @@ export interface Transport {
   logs?(tail: number): Promise<string>;
   /** Cloud only: export the stopped machine as a `.smolmachine` in the registry. */
   exportArtifact?(): Promise<Record<string, unknown>>;
+  /** Cloud only: start a detached job. */
+  startJob?(command: string[] | string, opts: JobOptions): Promise<JobInfo>;
+  /** Cloud only: the machine's jobs, newest first. */
+  listJobs?(): Promise<JobInfo[]>;
+  /** Cloud only: one job's live state. */
+  getJob?(jobId: string): Promise<JobInfo>;
+  /** Cloud only: a slice of a job's stdout or stderr. */
+  jobOutput?(jobId: string, opts: JobOutputOptions): Promise<JobOutput>;
+  /** Cloud only: stop a job with SIGTERM. */
+  cancelJob?(jobId: string): Promise<JobInfo>;
   state(): Promise<string>;
   ready(): Promise<boolean>;
   readyAt(): Promise<string | null>;
@@ -1717,6 +1731,65 @@ class CloudTransport implements Transport {
       json: {},
       timeoutMs: CLOUD_START_TIMEOUT_MS,
     });
+  }
+
+  async startJob(command: string[] | string, opts: JobOptions): Promise<JobInfo> {
+    // Not idempotent: a resend could start the command twice.
+    return cloudFetch<JobInfo>(this.conn, "POST", `/v1/machines/${this.id}/jobs`, {
+      json: {
+        command,
+        cwd: opts.workdir,
+        env: opts.env ?? {},
+        timeoutSeconds: opts.timeout,
+        user: opts.user,
+      },
+      timeoutMs: CLOUD_START_TIMEOUT_MS,
+    });
+  }
+
+  async listJobs(): Promise<JobInfo[]> {
+    const out = await cloudFetch<{ jobs: JobInfo[] }>(this.conn, "GET", `/v1/machines/${this.id}/jobs`);
+    return out.jobs;
+  }
+
+  async getJob(jobId: string): Promise<JobInfo> {
+    return cloudFetch<JobInfo>(
+      this.conn,
+      "GET",
+      `/v1/machines/${this.id}/jobs/${encodeURIComponent(jobId)}`,
+    );
+  }
+
+  async jobOutput(jobId: string, opts: JobOutputOptions): Promise<JobOutput> {
+    const q = new URLSearchParams({ stream: opts.stream ?? "stdout", offset: String(opts.offset ?? 0) });
+    if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+    const out = await cloudFetch<{
+      stream: "stdout" | "stderr";
+      offset: number;
+      nextOffset: number;
+      data: string;
+      dataB64?: string;
+      eof: boolean;
+    }>(this.conn, "GET", `/v1/machines/${this.id}/jobs/${encodeURIComponent(jobId)}/output?${q}`);
+    const data = out.dataB64 !== undefined ? Buffer.from(out.dataB64, "base64") : Buffer.from(out.data);
+    return {
+      stream: out.stream,
+      offset: out.offset,
+      nextOffset: out.nextOffset,
+      data,
+      text: out.data,
+      eof: out.eof,
+    };
+  }
+
+  async cancelJob(jobId: string): Promise<JobInfo> {
+    // Cancelling twice is harmless, so a 503 may be resent.
+    return cloudFetch<JobInfo>(
+      this.conn,
+      "POST",
+      `/v1/machines/${this.id}/jobs/${encodeURIComponent(jobId)}/cancel`,
+      { idempotent: true },
+    );
   }
 
   async delete(): Promise<void> {

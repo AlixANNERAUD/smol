@@ -360,6 +360,23 @@ const { id } = await base.checkpoint();
 const a = await Machine.restoreCheckpoint(id, "project-a", undefined, { cacheDisk: { cache: "project-a" } });
 ```
 
+## Jobs: long commands that survive a dropped connection (cloud)
+
+`exec` holds one HTTP request open for the whole command, so a network blip or
+a long build can lose it. A job starts the command detached and returns its id
+at once. Its output and exit code stay in the machine, and the machine does not
+auto-stop while it runs:
+
+```ts
+const job = await m.startJob(["make", "test"], { workdir: "/src", timeout: 3600 });
+const done = await job.wait();                  // polls; { state: "exited", exitCode }
+const log = await job.readAll();                // all of stdout, byte-exact
+const page = await job.output({ stream: "stderr", offset: 0 }); // then page.nextOffset
+```
+
+`state` is `"lost"` if the machine stopped under the job. `job.cancel()` stops
+it (exit 143), and `m.job(id)` picks a job up again from another process.
+
 ## Building from source
 
 This package's native core lives alongside it (Rust, `src/*.rs`) and links the

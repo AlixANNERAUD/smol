@@ -5,16 +5,18 @@ Mirrors the Node ``test/cloud-mock.ts``: verifies the wire shapes the SDK sends
 exec response) and the routes/verbs, plus NotSupported gating.
 """
 
+import asyncio
 import base64
 import json
 import sys
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from smol import ConnectOptions, ExecOptions, Machine, MachineConfig, MountSpec, NotSupportedError, PortSpec, ResourceSpec, SmolError  # noqa: E402
+from smol import AsyncMachine, ConnectOptions, ExecOptions, Machine, MachineConfig, MountSpec, NotSupportedError, PortSpec, ResourceSpec, SmolError  # noqa: E402
 from smol.transport import _cloud_fetch  # noqa: E402  (internal — asserts request-id surfacing)
 
 MACHINE_ID = "mach-test123"
@@ -71,13 +73,70 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({"status": status, "code": code, "detail": detail, "retryable": True}).encode()
         self._send(status, body, "application/problem+json", {"retry-after": retry_after})
 
+    def _jobs(self, method: str):
+        """mach-jobs keeps detached jobs: j1 runs until its third status read,
+        and its stdout ends in a byte that is not UTF-8."""
+        jobs = captured.setdefault("jobs", {})
+        stdout = b"line1\nline2\n\xff"
+        public = lambda j: {k: v for k, v in j.items() if k != "reads"}
+        path, _, query = self.path.partition("?")
+        if path == "/v1/machines/mach-jobs":
+            return self._send(200, json.dumps({"id": "mach-jobs", "name": "jobs", "state": "started", "ready": True}).encode())
+        if path == "/v1/machines/mach-jobs/jobs" and method == "POST":
+            captured["job_creates"] = captured.get("job_creates", 0) + 1
+            body = json.loads(self._read() or b"{}")
+            captured["job_body"] = body
+            if body.get("command") == "flaky":
+                return self._problem(503, "unavailable", "node restarting", "0")
+            cmd = body["command"] if isinstance(body["command"], list) else ["sh", "-c", body["command"]]
+            job = {"id": f"j{len(jobs) + 1}", "machineId": "mach-jobs", "command": cmd, "state": "running",
+                   "createdAt": "2026-10-12T06:00:00Z", "reads": 0}
+            jobs[job["id"]] = job
+            return self._send(202, json.dumps(public(job)).encode())
+        if path == "/v1/machines/mach-jobs/jobs":
+            return self._send(200, json.dumps({"jobs": [public(j) for j in reversed(list(jobs.values()))]}).encode())
+        parts = path.split("/")[5:]
+        job = jobs.get(parts[0]) if parts else None
+        if job is None:
+            return self._send(404, json.dumps({"status": 404, "code": "not_found", "detail": "no such job"}).encode())
+        tail = parts[1] if len(parts) > 1 else ""
+        if method == "GET" and not tail:
+            job["reads"] += 1
+            if job["state"] == "running" and job["reads"] >= 3:
+                job.update(state="exited", exitCode=0, finishedAt="2026-10-12T06:00:05Z")
+            return self._send(200, json.dumps({**public(job), "stdoutBytes": len(stdout), "stderrBytes": 0}).encode())
+        if method == "GET" and tail == "output":
+            q = dict(urllib.parse.parse_qsl(query))
+            captured.setdefault("output_queries", []).append(query)
+            data = stdout if q.get("stream", "stdout") == "stdout" else b""
+            offset = int(q.get("offset", 0))
+            chunk = data[offset:offset + min(int(q.get("limit", 5)), 5)]
+            nxt = offset + len(chunk)
+            return self._send(200, json.dumps({
+                "stream": q.get("stream", "stdout"), "offset": offset, "nextOffset": nxt,
+                "data": chunk.decode("utf-8", "replace"), "dataB64": base64.b64encode(chunk).decode(),
+                "eof": job["state"] != "running" and nxt >= len(data),
+            }).encode())
+        if method == "POST" and tail == "cancel":
+            captured["job_cancels"] = captured.get("job_cancels", 0) + 1
+            if captured["job_cancels"] == 1:
+                return self._problem(503, "unavailable", "node restarting", "0")
+            job.update(state="exited", exitCode=143, finishedAt="2026-10-12T06:00:09Z")
+            return self._send(202, json.dumps(public(job)).encode())
+        return self._send(404, b"no route")
+
     def do_POST(self):
         captured["hits"].append(f"POST {self.path}")
         if not self._auth_ok():
             return self._send(401, b"bad token")
+        if self.path.startswith("/v1/machines/mach-jobs"):
+            return self._jobs("POST")
         # mach-flaky: an exec is rate limited once, then its machine goes away
         # under the next one.
         if self.path == "/v1/machines/mach-flaky/exec":
+            # Drain the body: closing with it unread can reset the connection
+            # before the client reads the answer.
+            self._read()
             captured["flaky_execs"] = captured.get("flaky_execs", 0) + 1
             if captured["flaky_execs"] == 1:
                 return self._problem(429, "too_many_requests", "rate limit exceeded", "0")
@@ -273,6 +332,8 @@ class Handler(BaseHTTPRequestHandler):
         captured["hits"].append(f"GET {self.path}")
         if not self._auth_ok():
             return self._send(401, b"bad token")
+        if self.path.startswith("/v1/machines/mach-jobs"):
+            return self._jobs("GET")
         # mach-flaky: reads are briefly unavailable twice, then answer.
         if self.path == "/v1/machines/mach-flaky":
             captured["flaky_gets"] = captured.get("flaky_gets", 0) + 1
@@ -873,6 +934,58 @@ def main() -> int:
         check("max_retries=0 surfaces the first 503",
               no_retry is not None and no_retry.status == 503 and captured.get("flaky_gets") == 1,
               str(captured.get("flaky_gets")))
+
+        # Jobs: a detached command polled by id and read from an offset. Retry
+        # settings are kept per API key, so undo the max_retries=0 above.
+        cloud = ConnectOptions(target="cloud", base_url=base, api_key="smk_testkey", max_retries=3)
+        jm = Machine.connect("mach-jobs", cloud)
+        job = jm.start_job(["python3", "train.py"], workdir="/work", env={"A": "1"}, timeout=60)
+        check("start_job sends the command, cwd, env and timeout",
+              job.id == "j1" and captured.get("job_body") == {
+                  "command": ["python3", "train.py"], "env": {"A": "1"}, "cwd": "/work", "timeoutSeconds": 60},
+              str(captured.get("job_body")))
+        done = job.wait(poll_s=0.001)
+        check("wait polls until the job exits", done.state == "exited" and done.exit_code == 0, str(done))
+        first = job.output(limit=4)
+        check("output reads a slice and says where to read next",
+              first.text == "line" and first.next_offset == 4 and not first.eof
+              and captured["output_queries"][-1] == "stream=stdout&offset=0&limit=4",
+              f"{first} {captured['output_queries'][-1]}")
+        everything = job.read_all()
+        check("read_all follows offsets to eof, byte-exact", everything == b"line1\nline2\n\xff", repr(everything))
+        check("read_all of an empty stream is empty", job.read_all("stderr") == b"")
+        listed_jobs = jm.jobs()
+        check("jobs lists the machine's jobs", [j.id for j in listed_jobs] == ["j1"], str(listed_jobs))
+        shell = jm.start_job("sleep 600")
+        timed_out = None
+        try:
+            shell.wait(poll_s=0.001, timeout_s=0.001)
+        except SmolError as e:
+            timed_out = e
+        check("wait gives up with TIMEOUT", timed_out is not None and timed_out.code == "TIMEOUT", str(timed_out))
+        cancelled = jm.job(shell.id).cancel()
+        check("cancel is resent through a 503 and records 143",
+              cancelled.exit_code == 143 and captured.get("job_cancels") == 2,
+              f"cancels={captured.get('job_cancels')} {cancelled}")
+        creates_before = captured["job_creates"]
+        flaky_job = None
+        try:
+            jm.start_job("flaky")
+        except SmolError as e:
+            flaky_job = e
+        check("a 503 on start_job is not resent, since the job may have started",
+              flaky_job is not None and flaky_job.retryable and captured["job_creates"] == creates_before + 1,
+              f"creates={captured['job_creates'] - creates_before}")
+
+        async def async_jobs():
+            am = await AsyncMachine.connect("mach-jobs", cloud)
+            aj = await am.start_job(["true"])
+            final = await aj.wait(poll_s=0.001)
+            return final, await aj.read_all()
+
+        a_final, a_out = asyncio.run(async_jobs())
+        check("AsyncJob waits and reads like Job", a_final.state == "exited" and a_out == b"line1\nline2\n\xff",
+              f"{a_final} {a_out!r}")
     finally:
         server.shutdown()
 

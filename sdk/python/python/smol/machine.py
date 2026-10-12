@@ -13,6 +13,7 @@ Mirrors the Node SDK's ``machine.ts`` (sync, since the embedded engine blocks)::
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from typing import Any, Callable, Optional
 
@@ -31,8 +32,10 @@ from .transport import (
     restore_checkpoint_transport,
     upload_checkpoint,
 )
-from .errors import NotSupportedError, wrap_native_error
+from .errors import NotSupportedError, SmolError, wrap_native_error
 from .types import (
+    JobInfo,
+    JobOutput,
     MachineSummary,
     CacheDiskInfo,
     CacheDiskRef,
@@ -248,6 +251,44 @@ class Machine:
         if not hasattr(self._t, "export_artifact"):
             raise NotSupportedError("export_artifact is cloud-only")
         return self._t.export_artifact()
+
+    def start_job(
+        self,
+        command: "list[str] | str",
+        *,
+        workdir: Optional[str] = None,
+        env: Optional[dict] = None,
+        timeout: Optional[int] = None,
+        user: Optional[str] = None,
+    ) -> "Job":
+        """Start ``command`` as a detached job and return at once. Its output
+        and exit code are kept in the machine, so the caller can disconnect and
+        come back: poll with :meth:`Job.wait`, read output from an offset with
+        :meth:`Job.output`. The machine does not auto-stop while the job runs.
+        A string runs through ``sh -c``; the image needs ``sh``. ``timeout``
+        stops the job with SIGTERM after that many seconds (exit 143). Cloud
+        only.
+
+        Unlike :meth:`exec`, a job survives a dropped connection, so prefer it
+        for anything that runs longer than a few minutes."""
+        if not hasattr(self._t, "start_job"):
+            raise NotSupportedError("start_job is cloud-only")
+        info = self._t.start_job(command, workdir=workdir, env=env, timeout=timeout, user=user)
+        return Job(self._t, info.id)
+
+    def jobs(self) -> "list[JobInfo]":
+        """This machine's jobs, newest first, as last recorded (up to 100).
+        Use :meth:`Job.info` for a job's live state. Cloud only."""
+        if not hasattr(self._t, "list_jobs"):
+            raise NotSupportedError("jobs is cloud-only")
+        return self._t.list_jobs()
+
+    def job(self, job_id: str) -> "Job":
+        """A handle to an existing job by id, for example one started by another
+        process. Makes no request. Cloud only."""
+        if not hasattr(self._t, "get_job"):
+            raise NotSupportedError("job is cloud-only")
+        return Job(self._t, job_id)
 
     def ready(self) -> bool:
         """Whether the machine is READY to do work. :meth:`state` becoming
@@ -595,6 +636,59 @@ class Machine:
 
     def __exit__(self, *exc: object) -> None:
         self.delete()
+
+
+class Job:
+    """A detached command in a cloud machine, from :meth:`Machine.start_job`."""
+
+    def __init__(self, transport: Any, job_id: str) -> None:
+        self._t = transport
+        self.id = job_id
+
+    def info(self) -> JobInfo:
+        """The job's live state. A running job's machine is asked whether it
+        has finished; ``"lost"`` means the machine stopped or restarted under
+        it."""
+        return self._t.get_job(self.id)
+
+    def output(self, *, stream: str = "stdout", offset: int = 0, limit: Optional[int] = None) -> JobOutput:
+        """A slice of ``stream`` from ``offset``. The server returns up to 256
+        KiB by default and at most 1 MiB."""
+        return self._t.job_output(self.id, stream=stream, offset=offset, limit=limit)
+
+    def read_all(self, stream: str = "stdout") -> bytes:
+        """Everything written to ``stream`` so far. On a finished job, that is
+        all of it."""
+        chunks = []
+        offset = 0
+        while True:
+            out = self.output(stream=stream, offset=offset, limit=1024 * 1024)
+            chunks.append(out.data)
+            offset = out.next_offset
+            if out.eof or not out.data:
+                break
+        return b"".join(chunks)
+
+    def cancel(self) -> JobInfo:
+        """Stop the job with SIGTERM. It is recorded as exited with code 143."""
+        return self._t.cancel_job(self.id)
+
+    def wait(self, *, poll_s: float = 1.0, timeout_s: Optional[float] = None) -> JobInfo:
+        """Poll until the job is no longer running and return its final state:
+        ``"exited"`` with ``exit_code``, or ``"lost"``. Raises ``SmolError``
+        ``TIMEOUT`` after ``timeout_s``; the job keeps running."""
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while True:
+            info = self.info()
+            if info.state != "running":
+                return info
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise SmolError("TIMEOUT", f"job {self.id} still running after {timeout_s:g}s")
+                time.sleep(min(poll_s, left))
+            else:
+                time.sleep(poll_s)
 
 
 class Episode:
