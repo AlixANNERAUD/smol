@@ -441,7 +441,6 @@ fn credential_policy(
                     .collect()
             }),
             name,
-            set_header: None,
         });
     }
     Ok((
