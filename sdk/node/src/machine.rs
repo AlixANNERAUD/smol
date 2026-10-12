@@ -937,7 +937,6 @@ fn credential_policy(
                         .map(|method| method.to_string())
                         .collect()
                 }),
-                set_header: None,
             }
         })
         .collect();
