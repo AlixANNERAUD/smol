@@ -17,14 +17,14 @@ from .errors import (
     SmolError,
     wrap_native_error,
 )
-from .async_machine import AsyncEpisode, AsyncMachine
+from .async_machine import AsyncEpisode, AsyncJob, AsyncMachine
 from .device_handoff import (
     DeviceAdapterBundle,
     DeviceAdapterServer,
     DeviceTensor,
     publish_device_adapter,
 )
-from .machine import CacheDisk, Episode, Machine
+from .machine import CacheDisk, Episode, Job, Machine
 from .transport import ExecStream, local_availability
 from .rollout import RolloutClient, RolloutError, adapter_sha256
 from .types import (
@@ -38,6 +38,8 @@ from .types import (
     ExecOptions,
     ExecResult,
     ImageInfo,
+    JobInfo,
+    JobOutput,
     MachineConfig,
     MachineSummary,
     MachineUsageReport,
@@ -57,6 +59,10 @@ __all__ = [
     "AsyncMachine",
     "Episode",
     "AsyncEpisode",
+    "Job",
+    "AsyncJob",
+    "JobInfo",
+    "JobOutput",
     "MachineConfig",
     "MachineSummary",
     "CredentialSpec",

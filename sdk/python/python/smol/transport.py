@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import weakref
 from typing import Any, Callable, Iterable, Iterator, Optional, Protocol
@@ -33,6 +34,8 @@ from urllib.parse import quote
 from .errors import InvalidConfigError, NotSupportedError, SmolError, wrap_native_error
 from .types import (
     ConnectOptions,
+    JobInfo,
+    JobOutput,
     MachineSummary,
     CacheDiskInfo,
     CacheDiskRef,
@@ -1350,6 +1353,70 @@ class CloudTransport:
             timeout=CLOUD_START_TIMEOUT_S,
         ) or {}
 
+    def start_job(
+        self,
+        command: "list[str] | str",
+        *,
+        workdir: Optional[str] = None,
+        env: Optional[dict] = None,
+        timeout: Optional[int] = None,
+        user: Optional[str] = None,
+    ) -> JobInfo:
+        """Start a detached job. Not idempotent: a resend could start it twice."""
+        body: dict = {"command": command, "env": env or {}}
+        if workdir is not None:
+            body["cwd"] = workdir
+        if timeout is not None:
+            body["timeoutSeconds"] = int(timeout)
+        if user is not None:
+            body["user"] = user
+        r = _cloud_fetch(
+            self._base, self._key, "POST", f"/v1/machines/{self._id}/jobs",
+            json_body=body, timeout=CLOUD_START_TIMEOUT_S,
+        )
+        return _job_info(r)
+
+    def list_jobs(self) -> "list[JobInfo]":
+        r = _cloud_fetch(self._base, self._key, "GET", f"/v1/machines/{self._id}/jobs") or {}
+        return [_job_info(j) for j in r.get("jobs", [])]
+
+    def get_job(self, job_id: str) -> JobInfo:
+        r = _cloud_fetch(
+            self._base, self._key, "GET", f"/v1/machines/{self._id}/jobs/{urllib.parse.quote(job_id, safe='')}"
+        )
+        return _job_info(r)
+
+    def job_output(
+        self, job_id: str, *, stream: str = "stdout", offset: int = 0, limit: Optional[int] = None
+    ) -> JobOutput:
+        q = {"stream": stream, "offset": str(int(offset))}
+        if limit is not None:
+            q["limit"] = str(int(limit))
+        r = _cloud_fetch(
+            self._base, self._key, "GET",
+            f"/v1/machines/{self._id}/jobs/{urllib.parse.quote(job_id, safe='')}/output?{urllib.parse.urlencode(q)}",
+        ) or {}
+        text = r.get("data", "")
+        b64 = r.get("dataB64")
+        data = base64.b64decode(b64) if b64 is not None else text.encode()
+        return JobOutput(
+            stream=r.get("stream", stream),
+            offset=int(r.get("offset", offset)),
+            next_offset=int(r.get("nextOffset", offset + len(data))),
+            data=data,
+            text=text,
+            eof=bool(r.get("eof", False)),
+        )
+
+    def cancel_job(self, job_id: str) -> JobInfo:
+        # Cancelling twice is harmless, so a 503 may be resent.
+        r = _cloud_fetch(
+            self._base, self._key, "POST",
+            f"/v1/machines/{self._id}/jobs/{urllib.parse.quote(job_id, safe='')}/cancel",
+            idempotent=True,
+        )
+        return _job_info(r)
+
     def start(self, interceptor: Optional[EgressInterceptor] = None, wait_until_ready: bool = True) -> None:
         if interceptor is not None:
             raise NotSupportedError("egress_interceptor is local-only")
@@ -1780,6 +1847,21 @@ def _cloud_error(status: int, raw: str, headers: Any, what: str) -> SmolError:
         problem_code=problem_code,
         retryable=retryable if isinstance(retryable, bool) else _retryable_status(status),
         retry_after_s=_retry_after_s(headers.get("retry-after") if headers else None),
+    )
+
+
+def _job_info(r: Any) -> JobInfo:
+    r = r or {}
+    return JobInfo(
+        id=str(r.get("id", "")),
+        machine_id=str(r.get("machineId", "")),
+        command=list(r.get("command", [])),
+        state=str(r.get("state", "")),
+        created_at=str(r.get("createdAt", "")),
+        exit_code=r.get("exitCode"),
+        finished_at=r.get("finishedAt"),
+        stdout_bytes=r.get("stdoutBytes"),
+        stderr_bytes=r.get("stderrBytes"),
     )
 
 

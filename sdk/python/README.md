@@ -431,6 +431,24 @@ ckpt = base.checkpoint()
 a = Machine.restore_checkpoint(ckpt.id, "project-a", cache_disk=CacheDiskRef("project-a"))
 ```
 
+## Jobs: long commands that survive a dropped connection (cloud)
+
+`exec` holds one HTTP request open for the whole command, so a network blip or
+a long build can lose it. A job starts the command detached and returns its id
+at once. Its output and exit code stay in the machine, and the machine does not
+auto-stop while it runs:
+
+```python
+job = m.start_job(["make", "test"], workdir="/src", timeout=3600)
+done = job.wait()                      # polls; done.state == "exited", done.exit_code
+log = job.read_all()                   # all of stdout, byte-exact
+page = job.output(stream="stderr", offset=0)  # then page.next_offset
+```
+
+`state` is `"lost"` if the machine stopped under the job. `job.cancel()` stops
+it (exit 143), and `m.job(job_id)` picks a job up again from another process.
+`AsyncMachine.start_job` returns an `AsyncJob` with the same methods.
+
 ## Install / build from source
 The cloud path is pure Python. The local path needs the native extension, which
 links `libkrun` from the sibling `smolvm` repo (three levels up).

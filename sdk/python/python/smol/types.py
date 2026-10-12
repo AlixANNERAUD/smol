@@ -441,3 +441,36 @@ class PublishedCacheDisk:
 
     cache_disk: CacheDiskInfo
     version: CacheDiskVersion
+
+
+@dataclass
+class JobInfo:
+    """A detached job and what is known about it (cloud target).
+
+    ``state`` is ``"running"``, ``"exited"`` (see ``exit_code``; 143 when it was
+    cancelled or hit its timeout), or ``"lost"`` when the machine stopped or
+    restarted while the job ran, so it never finished."""
+
+    id: str
+    machine_id: str
+    command: list[str]
+    state: str
+    created_at: str
+    exit_code: Optional[int] = None
+    finished_at: Optional[str] = None
+    stdout_bytes: Optional[int] = None
+    stderr_bytes: Optional[int] = None
+
+
+@dataclass
+class JobOutput:
+    """A slice of a job's stdout or stderr. Pass ``next_offset`` back to read
+    on; ``eof`` is true once the job has finished and the slice reaches the end
+    of the stream."""
+
+    stream: str
+    offset: int
+    next_offset: int
+    data: bytes
+    text: str
+    eof: bool

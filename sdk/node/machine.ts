@@ -10,7 +10,7 @@
 
 import { randomUUID } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
-import { ExecutionError, NotSupportedError, wrapNativeError } from "./errors";
+import { ExecutionError, NotSupportedError, SmolError, wrapNativeError } from "./errors";
 import { getNapiMachine } from "./native";
 import { localAvailability, type LocalAvailability } from "./availability";
 import {
@@ -45,6 +45,11 @@ import type {
   ForkBatchOptions,
   ForkOptions,
   ImageInfo,
+  JobInfo,
+  JobOptions,
+  JobOutput,
+  JobOutputOptions,
+  JobWaitOptions,
   ListOptions,
   MachineConfig,
   MachineSummary,
@@ -261,6 +266,34 @@ export class Machine {
   exportArtifact(): Promise<Record<string, unknown>> {
     if (!this.transport.exportArtifact) throw new NotSupportedError("exportArtifact is cloud-only.");
     return this.transport.exportArtifact();
+  }
+
+  /** Start `command` as a detached job and return at once. Its output and exit
+   *  code are kept in the machine, so the caller can disconnect and come back:
+   *  poll with {@link Job.wait}, read output from an offset with
+   *  {@link Job.output}. The machine does not auto-stop while the job runs.
+   *  A string runs through `sh -c`; the image needs `sh`. Cloud only.
+   *
+   *  Unlike `exec`, a job survives a dropped connection, so prefer it for
+   *  anything that runs longer than a few minutes. */
+  async startJob(command: string[] | string, opts: JobOptions = {}): Promise<Job> {
+    if (!this.transport.startJob) throw new NotSupportedError("startJob is cloud-only.");
+    const info = await this.transport.startJob(command, opts);
+    return new Job(this.transport, info.id);
+  }
+
+  /** This machine's jobs, newest first, as last recorded (up to 100). Use
+   *  {@link Job.info} for a job's live state. Cloud only. */
+  jobs(): Promise<JobInfo[]> {
+    if (!this.transport.listJobs) throw new NotSupportedError("jobs is cloud-only.");
+    return this.transport.listJobs();
+  }
+
+  /** A handle to an existing job by id, for example one started by another
+   *  process. Makes no request. Cloud only. */
+  job(id: string): Job {
+    if (!this.transport.getJob) throw new NotSupportedError("job is cloud-only.");
+    return new Job(this.transport, id);
   }
 
   /** Whether the machine is READY to do work. `state()` becoming "started"
@@ -554,6 +587,80 @@ export class Machine {
       await clone.delete().catch(() => {});
     }
   }
+}
+
+/** A detached command in a cloud machine, from {@link Machine.startJob}. */
+export class Job {
+  readonly #transport: Transport;
+  readonly id: string;
+
+  constructor(transport: Transport, id: string) {
+    this.#transport = transport;
+    this.id = id;
+  }
+
+  /** The job's live state. A running job's machine is asked whether it has
+   *  finished; `lost` means the machine stopped or restarted under it. */
+  info(): Promise<JobInfo> {
+    return this.#transport.getJob!(this.id);
+  }
+
+  /** A slice of stdout (default) or stderr from `offset`. Pass the returned
+   *  `nextOffset` back to read on; `eof` is true once the job has finished and
+   *  the slice reaches the end. */
+  output(opts: JobOutputOptions = {}): Promise<JobOutput> {
+    return this.#transport.jobOutput!(this.id, opts);
+  }
+
+  /** Everything written to `stream` so far. On a finished job, that is all
+   *  of it. */
+  async readAll(stream: "stdout" | "stderr" = "stdout"): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let offset = 0;
+    for (;;) {
+      const out = await this.output({ stream, offset, limit: 1024 * 1024 });
+      chunks.push(out.data);
+      offset = out.nextOffset;
+      if (out.eof || out.data.length === 0) break;
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /** Stop the job with SIGTERM. It is recorded as exited with code 143. */
+  cancel(): Promise<JobInfo> {
+    return this.#transport.cancelJob!(this.id);
+  }
+
+  /** Poll until the job is no longer running and return its final state:
+   *  `exited` with `exitCode`, or `lost`. */
+  async wait(opts: JobWaitOptions = {}): Promise<JobInfo> {
+    const pollMs = opts.pollMs ?? 1000;
+    const deadline = opts.timeoutMs === undefined ? Infinity : Date.now() + opts.timeoutMs;
+    for (;;) {
+      opts.signal?.throwIfAborted();
+      const info = await this.info();
+      if (info.state !== "running") return info;
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        throw new SmolError("TIMEOUT", `job ${this.id} still running after ${opts.timeoutMs}ms`);
+      }
+      await sleep(Math.min(pollMs, left), opts.signal);
+    }
+  }
+}
+
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /** A leased RL episode: a freshly-provisioned clone plus its lease. Created by

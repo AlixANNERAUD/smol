@@ -288,6 +288,72 @@ const server = createServer(async (req, res) => {
   if (method === "GET" && /^\/v1\/machines\/(b\d+|ep\d+)$/.test(url)) {
     return json(200, { id: url.split("/").pop(), state: "running" });
   }
+  // m-jobs keeps detached jobs: j1 runs until its third status read, and its
+  // stdout ends in a byte that is not UTF-8.
+  if (method === "GET" && url === "/v1/machines/m-jobs") {
+    return json(200, { id: "m-jobs", state: "started", ready: true });
+  }
+  if (url.startsWith("/v1/machines/m-jobs/jobs")) {
+    const jobs: Map<string, any> = (seen.jobs ??= new Map());
+    const problem = (code: number, detail: string) => {
+      res.writeHead(code, { "content-type": "application/problem+json", "retry-after": "0" });
+      return res.end(JSON.stringify({ status: code, code: "unavailable", detail, retryable: true }));
+    };
+    if (method === "POST" && url === "/v1/machines/m-jobs/jobs") {
+      seen.jobCreates = (seen.jobCreates ?? 0) + 1;
+      const body = JSON.parse((await readBody(req)).toString());
+      seen.jobBody = body;
+      if (body.command === "flaky") return problem(503, "node restarting");
+      const id = `j${jobs.size + 1}`;
+      const argv = Array.isArray(body.command) ? body.command : ["sh", "-c", body.command];
+      const job = { id, machineId: "m-jobs", command: argv, state: "running", createdAt: "2026-10-12T06:00:00Z", reads: 0 };
+      jobs.set(id, job);
+      res.writeHead(202, { "content-type": "application/json" });
+      const { reads: _r, ...pub } = job;
+      return res.end(JSON.stringify(pub));
+    }
+    if (method === "GET" && url === "/v1/machines/m-jobs/jobs") {
+      return json(200, { jobs: [...jobs.values()].reverse().map(({ reads: _r, ...j }) => j) });
+    }
+    const m = url.match(/^\/v1\/machines\/m-jobs\/jobs\/([^/?]+)(\/output|\/cancel)?(?:\?(.*))?$/);
+    const job = m && jobs.get(decodeURIComponent(m[1]));
+    if (!job) return json(404, { status: 404, code: "not_found", detail: "no such job" });
+    const stdout = Buffer.concat([Buffer.from("line1\nline2\n"), Buffer.from([0xff])]);
+    if (method === "GET" && !m[2]) {
+      job.reads++;
+      if (job.state === "running" && job.reads >= 3) {
+        Object.assign(job, { state: "exited", exitCode: 0, finishedAt: "2026-10-12T06:00:05Z" });
+      }
+      const { reads: _r, ...pub } = job;
+      return json(200, { ...pub, stdoutBytes: stdout.length, stderrBytes: 0 });
+    }
+    if (method === "GET" && m[2] === "/output") {
+      const q = new URLSearchParams(m[3] ?? "");
+      seen.outputQueries = [...(seen.outputQueries ?? []), m[3]];
+      const stream = q.get("stream") ?? "stdout";
+      const all = stream === "stdout" ? stdout : Buffer.alloc(0);
+      const offset = Number(q.get("offset") ?? 0);
+      const limit = Number(q.get("limit") ?? 5);
+      const slice = all.subarray(offset, offset + Math.min(limit, 5));
+      const next = offset + slice.length;
+      return json(200, {
+        stream,
+        offset,
+        nextOffset: next,
+        data: slice.toString("utf8"),
+        dataB64: slice.toString("base64"),
+        eof: job.state !== "running" && next >= all.length,
+      });
+    }
+    if (method === "POST" && m[2] === "/cancel") {
+      seen.jobCancels = (seen.jobCancels ?? 0) + 1;
+      if (seen.jobCancels === 1) return problem(503, "node restarting");
+      Object.assign(job, { state: "exited", exitCode: 143, finishedAt: "2026-10-12T06:00:09Z" });
+      const { reads: _r, ...pub } = job;
+      res.writeHead(202, { "content-type": "application/json" });
+      return res.end(JSON.stringify(pub));
+    }
+  }
   // m-flaky answers like a control plane under load: reads are briefly
   // unavailable, an exec is rate limited once, then its machine goes away
   // under the next one.
@@ -1231,6 +1297,59 @@ async function main(): Promise<void> {
     noRetry = e;
   }
   check("maxRetries: 0 surfaces the first 503", (noRetry as SmolError)?.status === 503 && seen.flakyGets === 1, `gets=${seen.flakyGets}`);
+
+  // Jobs: a detached command polled by id and read from an offset.
+  const jm = await Machine.connect("m-jobs", cloud);
+  const job = await jm.startJob(["python3", "train.py"], { workdir: "/work", env: { A: "1" }, timeout: 60 });
+  check(
+    "startJob sends the command, cwd, env and timeout",
+    job.id === "j1" &&
+      JSON.stringify(seen.jobBody) === JSON.stringify({ command: ["python3", "train.py"], cwd: "/work", env: { A: "1" }, timeoutSeconds: 60 }),
+    JSON.stringify(seen.jobBody),
+  );
+  const done = await job.wait({ pollMs: 1 });
+  check("wait polls until the job exits", done.state === "exited" && done.exitCode === 0, JSON.stringify(done));
+  const first = await job.output({ limit: 4 });
+  check(
+    "output reads a slice and says where to read next",
+    first.text === "line" && first.nextOffset === 4 && !first.eof && seen.outputQueries.at(-1) === "stream=stdout&offset=0&limit=4",
+    `${JSON.stringify(first)} ${seen.outputQueries.at(-1)}`,
+  );
+  const all = await job.readAll();
+  check(
+    "readAll follows offsets to eof, byte-exact",
+    all.equals(Buffer.concat([Buffer.from("line1\nline2\n"), Buffer.from([0xff])])),
+    all.toString("hex"),
+  );
+  check("readAll of an empty stream is empty", (await job.readAll("stderr")).length === 0);
+  const jobList = await jm.jobs();
+  check("jobs lists the machine's jobs", jobList.length === 1 && jobList[0].id === "j1", JSON.stringify(jobList));
+  const shell = await jm.startJob("sleep 600");
+  let timedOut: unknown;
+  try {
+    await shell.wait({ pollMs: 1, timeoutMs: 1 });
+  } catch (e) {
+    timedOut = e;
+  }
+  check("wait gives up with TIMEOUT", (timedOut as SmolError)?.code === "TIMEOUT", String(timedOut));
+  const cancelled = await jm.job(shell.id).cancel();
+  check(
+    "cancel is resent through a 503 and records 143",
+    cancelled.exitCode === 143 && seen.jobCancels === 2,
+    `cancels=${seen.jobCancels} ${JSON.stringify(cancelled)}`,
+  );
+  const createsBefore = seen.jobCreates;
+  let flakyJob: unknown;
+  try {
+    await jm.startJob("flaky");
+  } catch (e) {
+    flakyJob = e;
+  }
+  check(
+    "a 503 on startJob is not resent, since the job may have started",
+    (flakyJob as SmolError)?.retryable === true && seen.jobCreates === createsBefore + 1,
+    `creates=${seen.jobCreates - createsBefore}`,
+  );
 
   console.log(`\n${passed} passed, ${failed} failed`);
   server.close();
