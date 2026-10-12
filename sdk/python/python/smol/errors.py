@@ -19,13 +19,35 @@ __all__ = [
 ]
 
 
+from typing import Optional
+
+
 class SmolError(Exception):
     """Base error for the SDK. Carries a machine-readable ``code``."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: Optional[int] = None,
+        problem_code: Optional[str] = None,
+        retryable: bool = False,
+        retry_after_s: Optional[float] = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.status = status
+        """HTTP status, for an error the cloud API returned."""
+        self.problem_code = problem_code
+        """The server's stable problem code, e.g. ``machine_interrupted``."""
+        self.retryable = retryable
+        """Whether sending the same request again can succeed. A command whose
+        machine went away (``MACHINE_INTERRUPTED``) is retryable, but it may have
+        partly run, so the SDK leaves that retry to the caller."""
+        self.retry_after_s = retry_after_s
+        """How long the server asked callers to wait before retrying."""
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.message

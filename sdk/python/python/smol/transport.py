@@ -1195,15 +1195,12 @@ class CloudTransport:
         try:
             resp = urllib.request.urlopen(req, timeout=CLOUD_TIMEOUT_S)
         except urllib.error.HTTPError as e:
-            text = ""
+            raw = ""
             try:
-                text = e.read().decode(errors="replace")
+                raw = e.read().decode(errors="replace")
             except Exception:  # noqa: BLE001
                 pass
-            code = "NOT_FOUND" if e.code == 404 else "UNAUTHORIZED" if e.code == 401 else "SMOLVM_ERROR"
-            rid = e.headers.get("x-request-id") if e.headers else None
-            suffix = f" [request id: {rid}]" if rid else ""
-            raise SmolError(code, f"cloud POST exec/stream → {e.code}{(': ' + text) if text else ''}{suffix}") from e
+            raise _cloud_error(e.code, raw, e.headers, "cloud POST exec/stream") from e
         except urllib.error.URLError as e:
             raise SmolError("CONNECTION", f"cloud exec/stream failed: {getattr(e, 'reason', e)}") from e
         except TimeoutError as e:
@@ -1323,13 +1320,16 @@ class CloudTransport:
         )
 
     def stop(self) -> None:
-        _cloud_fetch(self._base, self._key, "POST", f"/v1/machines/{self._id}/stop")
+        _cloud_fetch(self._base, self._key, "POST", f"/v1/machines/{self._id}/stop", idempotent=True)
 
     def pause(self) -> None:
         _cloud_fetch(self._base, self._key, "POST", f"/v1/machines/{self._id}/pause", timeout=CLOUD_START_TIMEOUT_S)
 
     def resume(self, wait_until_ready: bool = True) -> None:
-        _cloud_fetch(self._base, self._key, "POST", f"/v1/machines/{self._id}/resume", timeout=CLOUD_START_TIMEOUT_S)
+        _cloud_fetch(
+            self._base, self._key, "POST", f"/v1/machines/{self._id}/resume",
+            timeout=CLOUD_START_TIMEOUT_S, idempotent=True,
+        )
         if wait_until_ready:
             _wait_for_ready(self._base, self._key, self._id)
 
@@ -1361,6 +1361,7 @@ class CloudTransport:
             "POST",
             f"/v1/machines/{self._id}/start",
             timeout=CLOUD_START_TIMEOUT_S,
+            idempotent=True,
         )
         if wait_until_ready:
             _wait_for_ready(self._base, self._key, self._id)
@@ -1705,7 +1706,117 @@ def _read_lines(resp: Any) -> Iterator[bytes]:
         yield line
 
 
+# Retries for a retryable response when the caller sets none.
+DEFAULT_CLOUD_RETRIES = 3
+# Longest single wait between retries, whatever ``Retry-After`` asks.
+MAX_RETRY_WAIT_S = 30.0
+# ``ConnectOptions.max_retries`` per connection, keyed by where it points: the
+# request helpers take a base URL and key rather than the options themselves.
+_CLOUD_RETRIES: dict[tuple[str, str], int] = {}
+
+
+def _remember_retries(base_url: str, api_key: str, conn: ConnectOptions) -> None:
+    if conn.max_retries is not None:
+        _CLOUD_RETRIES[(base_url, api_key)] = max(0, conn.max_retries)
+
+
+def _retry_after_s(header: Optional[str]) -> Optional[float]:
+    """Parse a ``Retry-After`` header (delta-seconds or an HTTP date)."""
+    if not header:
+        return None
+    value = header.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        from email.utils import parsedate_to_datetime
+
+        at = parsedate_to_datetime(value)
+        return max(0.0, at.timestamp() - time.time())
+    except (TypeError, ValueError):
+        return None
+
+
+def _retryable_status(status: int) -> bool:
+    return status in (408, 429, 502, 503, 504)
+
+
+def _sdk_may_retry(status: int, method: str, idempotent: bool) -> bool:
+    """Whether the SDK may resend on its own. A rate-limited request never ran,
+    so it is always safe; an unavailable one may have, so only a call that is
+    safe to repeat is sent again."""
+    if status == 429:
+        return True
+    if not _retryable_status(status):
+        return False
+    return idempotent or method in ("GET", "HEAD", "PUT", "DELETE")
+
+
+def _cloud_error(status: int, raw: str, headers: Any, what: str) -> SmolError:
+    """The typed error for a failed cloud response, carrying what its problem
+    body and headers say about retrying."""
+    problem: dict = {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            problem = parsed
+    except ValueError:
+        pass
+    text = raw
+    problem_code = problem.get("code") if isinstance(problem.get("code"), str) else None
+    if problem_code == "machine_interrupted":
+        code = "MACHINE_INTERRUPTED"
+    else:
+        code = "NOT_FOUND" if status == 404 else "UNAUTHORIZED" if status == 401 else "SMOLVM_ERROR"
+    # Surface the server's `x-request-id` correlation id — the error body is
+    # visible to callers but the response headers aren't, so without this the
+    # id is invisible and support can't correlate the failed call.
+    rid = headers.get("x-request-id") if headers else None
+    suffix = f" [request id: {rid}]" if rid else ""
+    retryable = problem.get("retryable")
+    return SmolError(
+        code,
+        f"{what} → {status}{(': ' + text) if text else ''}{suffix}",
+        status=status,
+        problem_code=problem_code,
+        retryable=retryable if isinstance(retryable, bool) else _retryable_status(status),
+        retry_after_s=_retry_after_s(headers.get("retry-after") if headers else None),
+    )
+
+
 def _cloud_fetch(
+    base_url: str,
+    api_key: str,
+    method: str,
+    path: str,
+    *,
+    json_body: Optional[dict] = None,
+    raw_body: Optional[bytes] = None,
+    accept: str = "json",
+    timeout: float = CLOUD_TIMEOUT_S,
+    idempotent: bool = False,
+) -> Any:
+    retries = _CLOUD_RETRIES.get((base_url, api_key), DEFAULT_CLOUD_RETRIES)
+    attempt = 0
+    while True:
+        try:
+            return _cloud_fetch_once(
+                base_url, api_key, method, path,
+                json_body=json_body, raw_body=raw_body, accept=accept, timeout=timeout,
+            )
+        except SmolError as error:
+            if (
+                attempt >= retries
+                or error.status is None
+                or not _sdk_may_retry(error.status, method, idempotent)
+            ):
+                raise
+            backoff = 0.5 * (2 ** attempt)
+            wait = error.retry_after_s if error.retry_after_s is not None else backoff
+            time.sleep(min(wait, MAX_RETRY_WAIT_S))
+            attempt += 1
+
+
+def _cloud_fetch_once(
     base_url: str,
     api_key: str,
     method: str,
@@ -1738,18 +1849,12 @@ def _cloud_fetch(
                 return None
             return json.loads(payload) if "application/json" in ct else None
     except urllib.error.HTTPError as e:
-        text = ""
+        raw = ""
         try:
-            text = e.read().decode(errors="replace")
+            raw = e.read().decode(errors="replace")
         except Exception:  # noqa: BLE001
             pass
-        code = "NOT_FOUND" if e.code == 404 else "UNAUTHORIZED" if e.code == 401 else "SMOLVM_ERROR"
-        # Surface the server's `x-request-id` correlation id — the error body is
-        # visible to callers but the response headers aren't, so without this the
-        # id is invisible and support can't correlate the failed call.
-        rid = e.headers.get("x-request-id") if e.headers else None
-        suffix = f" [request id: {rid}]" if rid else ""
-        raise SmolError(code, f"cloud {method} {path} → {e.code}{(': ' + text) if text else ''}{suffix}") from e
+        raise _cloud_error(e.code, raw, e.headers, f"cloud {method} {path}") from e
     except urllib.error.URLError as e:
         reason = getattr(e, "reason", e)
         raise SmolError("CONNECTION", f"cloud request failed: {reason}") from e
@@ -2017,6 +2122,7 @@ def make_transport(config: MachineConfig, conn: Optional[ConnectOptions] = None)
                 "user per command with ExecOptions(user=...) instead."
             )
         base_url = (conn.base_url or os.environ.get("SMOL_CLOUD_URL") or cli_url or DEFAULT_CLOUD_URL).rstrip("/")
+        _remember_retries(base_url, api_key, conn)
         _store_cloud_credentials(base_url, api_key, config.credentials)
 
         r = config.resources
@@ -2222,6 +2328,7 @@ def connect_transport(machine_id: str, conn: Optional[ConnectOptions] = None) ->
     if not api_key:
         raise InvalidConfigError(f"connect requires an api_key — {_NO_KEY_HINT}.")
     base_url = (conn.base_url or os.environ.get("SMOL_CLOUD_URL") or cli_url or DEFAULT_CLOUD_URL).rstrip("/")
+    _remember_retries(base_url, api_key, conn)
     # Resolve like the CLI does: try the id path first, and when that 404s,
     # list machines and match by NAME. `machine.name` returns the human name,
     # so `Machine.connect(other.name)` — the natural composition of this API —
@@ -2355,6 +2462,7 @@ def _cloud_credentials(conn: ConnectOptions, operation: str) -> tuple:
     base_url = (
         conn.base_url or os.environ.get("SMOL_CLOUD_URL") or cli_url or DEFAULT_CLOUD_URL
     ).rstrip("/")
+    _remember_retries(base_url, api_key, conn)
     return base_url, api_key
 
 

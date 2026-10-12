@@ -16,6 +16,9 @@ pub enum ErrorKind {
     Timeout,
     /// The request could not be delivered.
     Connection,
+    /// The machine stopped or became unreachable while a command ran in it.
+    /// Retrying can succeed, but the command may have partly run.
+    MachineInterrupted,
     /// Anything else the server reported.
     Other,
 }
@@ -29,6 +32,7 @@ impl ErrorKind {
             Self::Conflict => "CONFLICT",
             Self::Timeout => "TIMEOUT",
             Self::Connection => "CONNECTION",
+            Self::MachineInterrupted => "MACHINE_INTERRUPTED",
             Self::Other => "SMOLVM_ERROR",
         }
     }
@@ -50,6 +54,10 @@ pub struct Error {
     kind: ErrorKind,
     message: String,
     request_id: Option<String>,
+    status: Option<u16>,
+    problem_code: Option<String>,
+    retryable: bool,
+    retry_after: Option<std::time::Duration>,
 }
 
 impl Error {
@@ -59,7 +67,49 @@ impl Error {
             kind,
             message: message.into(),
             request_id: None,
+            status: None,
+            problem_code: None,
+            retryable: false,
+            retry_after: None,
         }
+    }
+
+    /// Attach what the server's response said: its status, problem code,
+    /// whether a retry can succeed, and how long it asked callers to wait.
+    pub fn with_response(
+        mut self,
+        status: u16,
+        problem_code: Option<String>,
+        retryable: bool,
+        retry_after: Option<std::time::Duration>,
+    ) -> Self {
+        self.status = Some(status);
+        self.problem_code = problem_code;
+        self.retryable = retryable;
+        self.retry_after = retry_after;
+        self
+    }
+
+    /// HTTP status, for an error the cloud API returned.
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    /// The server's stable problem code, e.g. `machine_interrupted`.
+    pub fn problem_code(&self) -> Option<&str> {
+        self.problem_code.as_deref()
+    }
+
+    /// Whether sending the same request again can succeed. A command whose
+    /// machine went away is retryable, but it may have partly run, so the
+    /// client leaves that retry to the caller.
+    pub fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    /// How long the server asked callers to wait before retrying.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        self.retry_after
     }
 
     /// Attach the server's correlation id.

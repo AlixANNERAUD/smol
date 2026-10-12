@@ -50,11 +50,13 @@ class Handler(BaseHTTPRequestHandler):
     def _auth_ok(self) -> bool:
         return self.headers.get("authorization") == "Bearer smk_testkey"
 
-    def _send(self, code: int, body: bytes = b"", ctype: str = "application/json"):
+    def _send(self, code: int, body: bytes = b"", ctype: str = "application/json", headers: dict | None = None):
         self.send_response(code)
         # The real control plane sets x-request-id on every response; mirror it
         # so the SDK's error-message surfacing can be asserted.
         self.send_header("x-request-id", "req-test-xyz")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         if body:
             self.send_header("content-type", ctype)
         self.end_headers()
@@ -65,10 +67,26 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("content-length", 0))
         return self.rfile.read(n) if n else b""
 
+    def _problem(self, status: int, code: str, detail: str, retry_after: str) -> None:
+        body = json.dumps({"status": status, "code": code, "detail": detail, "retryable": True}).encode()
+        self._send(status, body, "application/problem+json", {"retry-after": retry_after})
+
     def do_POST(self):
         captured["hits"].append(f"POST {self.path}")
         if not self._auth_ok():
             return self._send(401, b"bad token")
+        # mach-flaky: an exec is rate limited once, then its machine goes away
+        # under the next one.
+        if self.path == "/v1/machines/mach-flaky/exec":
+            captured["flaky_execs"] = captured.get("flaky_execs", 0) + 1
+            if captured["flaky_execs"] == 1:
+                return self._problem(429, "too_many_requests", "rate limit exceeded", "0")
+            if captured["flaky_execs"] == 2:
+                return self._send(200, json.dumps({"exitCode": 0, "stdout": "ok\n", "stderr": ""}).encode())
+            return self._problem(
+                503, "machine_interrupted",
+                "exec failed: the machine stopped or became unreachable while the command was running", "2",
+            )
         if self.path == "/v1/cache-disks":
             captured["cache_disk_create"] = json.loads(self._read() or b"{}")
             return self._send(201, json.dumps(cache_disk_info(0)).encode())
@@ -255,6 +273,12 @@ class Handler(BaseHTTPRequestHandler):
         captured["hits"].append(f"GET {self.path}")
         if not self._auth_ok():
             return self._send(401, b"bad token")
+        # mach-flaky: reads are briefly unavailable twice, then answer.
+        if self.path == "/v1/machines/mach-flaky":
+            captured["flaky_gets"] = captured.get("flaky_gets", 0) + 1
+            if captured["flaky_gets"] <= 2:
+                return self._problem(503, "unavailable", "node restarting", "0")
+            return self._send(200, json.dumps({"id": "mach-flaky", "name": "flaky", "state": "started", "ready": True}).encode())
         if self.path == "/v1/machines" or self.path.startswith("/v1/machines?"):
             captured["list_path"] = self.path
             return self._send(200, json.dumps({"machines": [{
@@ -823,6 +847,32 @@ def main() -> int:
         lm.start(wait_until_ready=False)
         check("start(wait_until_ready=False) does not poll readiness", readiness_gets.get(MACHINE_ID, 0) == polls,
               f"{polls} -> {readiness_gets.get(MACHINE_ID, 0)}")
+
+        # ---- retries: what the server marks retryable, when safe to repeat ----
+        flaky = Machine.connect("mach-flaky", cloud)
+        check("a read retries through brief 503s", captured.get("flaky_gets") == 3, str(captured.get("flaky_gets")))
+        ok = flaky.exec(["true"])
+        check("a rate-limited exec is sent again", ok.exit_code == 0 and captured.get("flaky_execs") == 2,
+              str(captured.get("flaky_execs")))
+        interrupted = None
+        try:
+            flaky.exec(["python3", "job.py"])
+        except SmolError as e:
+            interrupted = e
+        check("an interrupted exec is typed, retryable, and not resent",
+              interrupted is not None and interrupted.code == "MACHINE_INTERRUPTED" and interrupted.retryable
+              and interrupted.retry_after_s == 2.0 and interrupted.status == 503
+              and interrupted.problem_code == "machine_interrupted" and captured.get("flaky_execs") == 3,
+              repr(interrupted and (interrupted.code, interrupted.retryable, interrupted.retry_after_s)))
+        captured["flaky_gets"] = 0
+        no_retry = None
+        try:
+            Machine.connect("mach-flaky", ConnectOptions(target="cloud", base_url=base, api_key="smk_testkey", max_retries=0))
+        except SmolError as e:
+            no_retry = e
+        check("max_retries=0 surfaces the first 503",
+              no_retry is not None and no_retry.status == 503 and captured.get("flaky_gets") == 1,
+              str(captured.get("flaky_gets")))
     finally:
         server.shutdown()
 
