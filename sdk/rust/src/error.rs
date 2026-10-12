@@ -38,6 +38,9 @@ pub enum ErrorKind {
     Timeout,
     /// The operation exists, but not on this target.
     NotSupported,
+    /// The machine stopped or became unreachable while a command ran in it.
+    /// Retrying can succeed, but the command may have partly run.
+    MachineInterrupted,
     /// Anything the SDK does not classify further.
     Other,
 }
@@ -59,6 +62,7 @@ impl ErrorKind {
             Self::Connection => "CONNECTION",
             Self::Timeout => "TIMEOUT",
             Self::NotSupported => "NOT_SUPPORTED",
+            Self::MachineInterrupted => "MACHINE_INTERRUPTED",
             Self::Other => "SMOLVM_ERROR",
         }
     }
@@ -75,6 +79,8 @@ impl fmt::Display for ErrorKind {
 pub struct Error {
     kind: ErrorKind,
     message: String,
+    retryable: bool,
+    retry_after: Option<std::time::Duration>,
 }
 
 impl Error {
@@ -83,7 +89,21 @@ impl Error {
         Self {
             kind,
             message: message.into(),
+            retryable: false,
+            retry_after: None,
         }
+    }
+
+    /// Whether sending the same request again can succeed, as the cloud API
+    /// reported it. A command whose machine went away is retryable, but it
+    /// may have partly run, so the SDK leaves that retry to the caller.
+    pub fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    /// How long the cloud API asked callers to wait before retrying.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        self.retry_after
     }
 
     /// What class of failure this is.
@@ -118,6 +138,7 @@ impl From<smol_cloud::Error> for Error {
             smol_cloud::ErrorKind::Conflict => ErrorKind::Conflict,
             smol_cloud::ErrorKind::Timeout => ErrorKind::Timeout,
             smol_cloud::ErrorKind::Connection => ErrorKind::Connection,
+            smol_cloud::ErrorKind::MachineInterrupted => ErrorKind::MachineInterrupted,
             _ => ErrorKind::Other,
         };
         // Keep the correlation id in the message: a caller sees the message,
@@ -127,7 +148,12 @@ impl From<smol_cloud::Error> for Error {
             Some(request_id) => format!("{} [request id: {request_id}]", err.message()),
             None => err.message().to_string(),
         };
-        Self { kind, message }
+        Self {
+            kind,
+            message,
+            retryable: err.retryable(),
+            retry_after: err.retry_after(),
+        }
     }
 }
 

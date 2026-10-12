@@ -288,6 +288,34 @@ const server = createServer(async (req, res) => {
   if (method === "GET" && /^\/v1\/machines\/(b\d+|ep\d+)$/.test(url)) {
     return json(200, { id: url.split("/").pop(), state: "running" });
   }
+  // m-flaky answers like a control plane under load: reads are briefly
+  // unavailable, an exec is rate limited once, then its machine goes away
+  // under the next one.
+  if (method === "GET" && url === "/v1/machines/m-flaky") {
+    seen.flakyGets = (seen.flakyGets ?? 0) + 1;
+    if (seen.flakyGets <= 2) {
+      res.writeHead(503, { "content-type": "application/problem+json", "retry-after": "0" });
+      return res.end(JSON.stringify({ status: 503, code: "unavailable", detail: "node restarting", retryable: true }));
+    }
+    return json(200, { id: "m-flaky", state: "started", ready: true });
+  }
+  if (method === "POST" && url === "/v1/machines/m-flaky/exec") {
+    seen.flakyExecs = (seen.flakyExecs ?? 0) + 1;
+    if (seen.flakyExecs === 1) {
+      res.writeHead(429, { "content-type": "application/problem+json", "retry-after": "0" });
+      return res.end(JSON.stringify({ status: 429, code: "too_many_requests", detail: "rate limit exceeded", retryable: true }));
+    }
+    if (seen.flakyExecs === 2) return json(200, { exitCode: 0, stdout: "ok\n", stderr: "" });
+    res.writeHead(503, { "content-type": "application/problem+json", "retry-after": "2" });
+    return res.end(
+      JSON.stringify({
+        status: 503,
+        code: "machine_interrupted",
+        detail: "exec failed: the machine stopped or became unreachable while the command was running, so the command may have partly run",
+        retryable: true,
+      }),
+    );
+  }
   if (method === "GET" && url === "/v1/machines/m1")
     return json(200, readinessResponse("m1", 2));
   if (method === "GET" && url === "/v1/machines/m-restored")
@@ -1171,6 +1199,38 @@ async function main(): Promise<void> {
   const pollsBefore = readinessGets["m1"] ?? 0;
   await lm.start({ waitUntilReady: false });
   check("start({ waitUntilReady: false }) does not poll readiness", (readinessGets["m1"] ?? 0) === pollsBefore, `${pollsBefore} -> ${readinessGets["m1"]}`);
+
+  // Retries: the SDK waits out what the server marks retryable when the call is
+  // safe to repeat, and leaves a command that may have partly run to the caller.
+  const flaky = await Machine.connect("m-flaky", cloud);
+  check("a read retries through brief 503s", seen.flakyGets === 3, `gets=${seen.flakyGets}`);
+  const afterLimit = await flaky.exec(["true"]);
+  check("a rate-limited exec is sent again", afterLimit.exitCode === 0 && seen.flakyExecs === 2, `execs=${seen.flakyExecs}`);
+  let interrupted: unknown;
+  try {
+    await flaky.exec(["python3", "job.py"]);
+  } catch (e) {
+    interrupted = e;
+  }
+  const ie = interrupted as SmolError;
+  check(
+    "an interrupted exec is typed, retryable, and not resent",
+    ie instanceof SmolError &&
+      ie.code === "MACHINE_INTERRUPTED" &&
+      ie.retryable === true &&
+      ie.retryAfterMs === 2000 &&
+      ie.status === 503 &&
+      seen.flakyExecs === 3,
+    `${ie?.code} retryable=${ie?.retryable} after=${ie?.retryAfterMs} execs=${seen.flakyExecs}`,
+  );
+  seen.flakyGets = 0;
+  let noRetry: unknown;
+  try {
+    await Machine.connect("m-flaky", { ...cloud, maxRetries: 0 });
+  } catch (e) {
+    noRetry = e;
+  }
+  check("maxRetries: 0 surfaces the first 503", (noRetry as SmolError)?.status === 503 && seen.flakyGets === 1, `gets=${seen.flakyGets}`);
 
   console.log(`\n${passed} passed, ${failed} failed`);
   server.close();

@@ -45,6 +45,10 @@ const UPLOAD_PART_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 /// Grace before the agent probe stands in for `ready`, so the flag keeps first
 /// refusal and the probe never preempts a machine about to flip.
 const NO_PORT_PROBE_GRACE: Duration = Duration::from_secs(2);
+/// Retries for a retryable response when the caller sets none.
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+/// Longest single wait between retries, whatever `Retry-After` asks.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 
 /// One event from a running command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +77,7 @@ pub struct Client {
     http: reqwest::blocking::Client,
     /// Streams only: async so a read can be raced against a cancel.
     stream_http: reqwest::Client,
+    max_retries: u32,
 }
 
 impl Client {
@@ -94,7 +99,18 @@ impl Client {
             credentials,
             http,
             stream_http,
+            max_retries: DEFAULT_MAX_RETRIES,
         })
+    }
+
+    /// How many times a request the server marks retryable is sent again,
+    /// waiting as its `Retry-After` asks. A 429 is retried for any call; a
+    /// 502/503/504 only for calls that are safe to repeat (reads, deletes,
+    /// start/stop/resume), never for exec or create, which could run twice.
+    /// Default [`DEFAULT_MAX_RETRIES`]; 0 turns retries off.
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 
     /// Build a client, resolving credentials from the environment and the CLI
@@ -117,9 +133,35 @@ impl Client {
         body: Body<'_>,
         timeout: Duration,
     ) -> Result<reqwest::blocking::Response> {
+        let mut attempt = 0;
+        loop {
+            match self.send_checked(&method, path, &body, timeout) {
+                Err(error)
+                    if attempt < self.max_retries
+                        && error
+                            .status()
+                            .is_some_and(|status| sdk_may_retry(status, &method, path)) =>
+                {
+                    let backoff = Duration::from_millis(500 * 2_u64.pow(attempt));
+                    std::thread::sleep(error.retry_after().unwrap_or(backoff).min(MAX_RETRY_WAIT));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn send_checked(
+        &self,
+        method: &reqwest::Method,
+        path: &str,
+        body: &Body<'_>,
+        timeout: Duration,
+    ) -> Result<reqwest::blocking::Response> {
+        let method = method.clone();
         self.credentials.renew_if_expiring()?;
         let key = self.credentials.api_key();
-        let response = self.send_once(&method, path, &body, timeout, &key)?;
+        let response = self.send_once(&method, path, body, timeout, &key)?;
         // A CLI session the control plane stopped honouring before its
         // recorded expiry gets one renewal and one retry; any other 401 is a
         // verdict.
@@ -127,7 +169,7 @@ impl Client {
             && self.credentials.renew_after_rejection(&key)?
         {
             let key = self.credentials.api_key();
-            let response = self.send_once(&method, path, &body, timeout, &key)?;
+            let response = self.send_once(&method, path, body, timeout, &key)?;
             return check_status(response, &method, path);
         }
         check_status(response, &method, path)
@@ -544,6 +586,7 @@ impl Client {
             Some(Ok(Ok(response))) => {
                 let status = response.status();
                 let request_id = request_id(response.headers());
+                let retry_after = retry_after(response.headers());
                 let text = runtime
                     .block_on(async {
                         tokio::time::timeout(REQUEST_TIMEOUT, response.text()).await
@@ -551,8 +594,14 @@ impl Client {
                     .ok()
                     .and_then(|text| text.ok())
                     .unwrap_or_default();
-                return Err(status_error(status, &reqwest::Method::POST, &path, &text)
-                    .with_request_id(request_id));
+                return Err(status_error(
+                    status,
+                    &reqwest::Method::POST,
+                    &path,
+                    &text,
+                    retry_after,
+                )
+                .with_request_id(request_id));
             }
         };
         Ok(SseEvents::new(StreamBody {
@@ -1065,8 +1114,47 @@ fn check_status(
         return Ok(response);
     }
     let request_id = request_id(response.headers());
+    let retry_after = retry_after(response.headers());
     let text = response.text().unwrap_or_default();
-    Err(status_error(status, method, path, &text).with_request_id(request_id))
+    Err(status_error(status, method, path, &text, retry_after).with_request_id(request_id))
+}
+
+/// Parse `Retry-After` given in delta-seconds, the form the control plane sends.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 502 | 503 | 504)
+}
+
+/// Whether the client may resend on its own. A rate-limited request never
+/// ran, so it is always safe; an unavailable one may have, so only a call that
+/// is safe to repeat is sent again.
+fn sdk_may_retry(status: u16, method: &reqwest::Method, path: &str) -> bool {
+    if status == 429 {
+        return true;
+    }
+    if !retryable_status(status) {
+        return false;
+    }
+    match *method {
+        reqwest::Method::GET
+        | reqwest::Method::HEAD
+        | reqwest::Method::PUT
+        | reqwest::Method::DELETE => true,
+        reqwest::Method::POST => {
+            let route = path.split('?').next().unwrap_or(path);
+            ["/start", "/stop", "/resume"]
+                .iter()
+                .any(|lifecycle| route.ends_with(lifecycle))
+        }
+        _ => false,
+    }
 }
 
 fn request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1081,13 +1169,30 @@ fn status_error(
     method: &reqwest::Method,
     path: &str,
     text: &str,
+    retry_after: Option<Duration>,
 ) -> Error {
     let mut message = format!("{method} {path} → {status}");
     let sentence = crate::error::body_sentence(text);
     if !sentence.is_empty() {
         message.push_str(&format!(": {sentence}"));
     }
-    Error::new(ErrorKind::from_status(status.as_u16()), message)
+    let problem = serde_json::from_str::<serde_json::Value>(text.trim()).ok();
+    let problem_code = problem
+        .as_ref()
+        .and_then(|p| p.get("code"))
+        .and_then(|c| c.as_str())
+        .map(str::to_owned);
+    let retryable = problem
+        .as_ref()
+        .and_then(|p| p.get("retryable"))
+        .and_then(|r| r.as_bool())
+        .unwrap_or_else(|| retryable_status(status.as_u16()));
+    let kind = if problem_code.as_deref() == Some("machine_interrupted") {
+        ErrorKind::MachineInterrupted
+    } else {
+        ErrorKind::from_status(status.as_u16())
+    };
+    Error::new(kind, message).with_response(status.as_u16(), problem_code, retryable, retry_after)
 }
 
 /// Ends a live [`Client::exec_stream_cancellable`] stream from any thread.
@@ -1394,6 +1499,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A server that answers each request with the next canned response
+    /// (status line, extra headers, body), repeating the last one. Returns its
+    /// URL and how many requests it has seen.
+    fn scripted_server(
+        responses: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = vec![0_u8; 8192];
+                let _ = stream.read(&mut request);
+                let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (status, headers, body) = responses[n.min(responses.len() - 1)];
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    const UNAVAILABLE: (&str, &str, &str) = (
+        "503 Service Unavailable",
+        "retry-after: 0\r\n",
+        r#"{"status":503,"code":"unavailable","detail":"node restarting","retryable":true}"#,
+    );
+
+    #[test]
+    fn a_read_retries_through_brief_unavailability() {
+        let (url, seen) = scripted_server(vec![UNAVAILABLE, UNAVAILABLE, ("200 OK", "", "[]")]);
+        let client = Client::new(Credentials::new(&url, "smk_test")).unwrap();
+        assert!(client.machines().unwrap().is_empty());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn an_interrupted_exec_is_typed_retryable_and_not_resent() {
+        let (url, seen) = scripted_server(vec![(
+            "503 Service Unavailable",
+            "retry-after: 2\r\n",
+            r#"{"status":503,"code":"machine_interrupted","detail":"the machine stopped","retryable":true}"#,
+        )]);
+        let client = Client::new(Credentials::new(&url, "smk_test")).unwrap();
+        let error = client
+            .exec(
+                "mach-x",
+                &Command {
+                    command: vec!["true".to_string()],
+                    ..Default::default()
+                },
+                REQUEST_TIMEOUT,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MachineInterrupted);
+        assert!(error.retryable());
+        assert_eq!(error.status(), Some(503));
+        assert_eq!(error.problem_code(), Some("machine_interrupted"));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(2)));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_rate_limited_exec_is_sent_again_and_zero_retries_turns_it_off() {
+        let limited = (
+            "429 Too Many Requests",
+            "retry-after: 0\r\n",
+            r#"{"status":429,"code":"too_many_requests","detail":"rate limit exceeded","retryable":true}"#,
+        );
+        let (url, seen) = scripted_server(vec![limited, UNAVAILABLE]);
+        let client = Client::new(Credentials::new(&url, "smk_test")).unwrap();
+        // The 429 is resent; the 503 that follows is not, because exec could run twice.
+        let error = client
+            .exec(
+                "mach-x",
+                &Command {
+                    command: vec!["true".to_string()],
+                    ..Default::default()
+                },
+                REQUEST_TIMEOUT,
+            )
+            .unwrap_err();
+        assert_eq!(error.status(), Some(503));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let (url, seen) = scripted_server(vec![UNAVAILABLE]);
+        let client = Client::new(Credentials::new(&url, "smk_test"))
+            .unwrap()
+            .with_max_retries(0);
+        assert_eq!(client.machines().unwrap_err().status(), Some(503));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_rejected_api_key_is_not_retried() {
         let (url, rejected) = rejecting_then_renewing_server();
@@ -1431,6 +1635,7 @@ mod tests {
             &post,
             "/v1/machines",
             problem,
+            None,
         );
         assert_eq!(
             err.message(),
@@ -1442,6 +1647,7 @@ mod tests {
             &post,
             "/v1/machines",
             old,
+            None,
         );
         assert_eq!(
             err.message(),
@@ -1453,12 +1659,19 @@ mod tests {
             &post,
             "/v1/machines",
             "name taken",
+            None,
         );
         assert_eq!(
             text.message(),
             "POST /v1/machines → 409 Conflict: name taken"
         );
-        let empty = status_error(reqwest::StatusCode::BAD_GATEWAY, &post, "/v1/machines", "");
+        let empty = status_error(
+            reqwest::StatusCode::BAD_GATEWAY,
+            &post,
+            "/v1/machines",
+            "",
+            None,
+        );
         assert_eq!(empty.message(), "POST /v1/machines → 502 Bad Gateway");
     }
 

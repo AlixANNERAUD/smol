@@ -5,12 +5,38 @@
  *  back into a typed hierarchy so callers can branch on `err.code` /`instanceof`.
  */
 
+/** What the cloud API said about a failed request, beyond its message. */
+export interface CloudErrorDetail {
+  /** HTTP status of the response. */
+  status: number;
+  /** The server's stable problem code, e.g. `machine_interrupted`. */
+  problemCode?: string | undefined;
+  /** Whether sending the same request again can succeed. */
+  retryable: boolean;
+  /** How long the server asked callers to wait before retrying (ms). */
+  retryAfterMs?: number | undefined;
+}
+
 export class SmolError extends Error {
   readonly code: string;
-  constructor(code: string, message: string) {
+  /** HTTP status, for an error the cloud API returned. */
+  readonly status?: number | undefined;
+  /** The server's stable problem code, for an error the cloud API returned. */
+  readonly problemCode?: string | undefined;
+  /** Whether sending the same request again can succeed. A command whose
+   *  machine went away (`MACHINE_INTERRUPTED`) is retryable, but it may have
+   *  partly run, so the SDK leaves that retry to the caller. */
+  readonly retryable: boolean;
+  /** How long the server asked callers to wait before retrying (ms). */
+  readonly retryAfterMs?: number | undefined;
+  constructor(code: string, message: string, detail?: CloudErrorDetail) {
     super(message);
     this.name = new.target.name;
     this.code = code;
+    this.status = detail?.status;
+    this.problemCode = detail?.problemCode;
+    this.retryable = detail?.retryable ?? false;
+    this.retryAfterMs = detail?.retryAfterMs;
   }
 }
 

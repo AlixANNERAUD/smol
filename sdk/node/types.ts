@@ -549,6 +549,12 @@ export interface ConnectOptions {
   /** Cloud only: read a binary response body, for a `fetch` whose responses
    *  lack a working `arrayBuffer()`. */
   readResponseBytes?: (response: Response) => Promise<Uint8Array>;
+  /** Cloud only: how many times a request the server marks retryable is sent
+   *  again, waiting as its `Retry-After` asks. A 429 is retried for any call;
+   *  a 502/503/504 only for calls that are safe to repeat (reads, deletes,
+   *  start/stop/resume), never for exec or create, which could run twice.
+   *  Default 3; 0 turns retries off. */
+  maxRetries?: number;
 }
 
 /** Per-launch trusted host service. Keep the token out of logs and persistent config. */

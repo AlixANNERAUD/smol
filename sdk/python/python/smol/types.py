@@ -355,6 +355,13 @@ class ConnectOptions:
     egress_interceptor: Optional[EgressInterceptor] = field(default=None, repr=False)
     wait_for_ports: bool = True
     """When connecting locally, wait for published applications as well as the agent."""
+    max_retries: Optional[int] = None
+    """Cloud only: how many times a request the server marks retryable is sent
+    again, waiting as its ``Retry-After`` asks. A 429 is retried for any call; a
+    502/503/504 only for calls that are safe to repeat (reads, deletes,
+    start/stop/resume), never for exec or create, which could run twice.
+    Default 3; 0 turns retries off. It applies to every connection that uses
+    the same base URL and API key."""
 
 
 @dataclass

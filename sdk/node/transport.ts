@@ -912,6 +912,8 @@ interface CloudConn {
   /** The caller's `fetch` (ConnectOptions.fetch), when it supplied one. */
   fetch?: typeof fetch;
   readResponseBytes?: (response: Response) => Promise<Uint8Array>;
+  /** ConnectOptions.maxRetries, when the caller set it. */
+  maxRetries?: number;
 }
 
 /** A cloud connection carrying the caller's transport hooks. */
@@ -921,6 +923,7 @@ function cloudConnOf(conn: ConnectOptions, baseUrl: string, apiKey: string): Clo
     apiKey,
     ...(conn.fetch ? { fetch: conn.fetch } : {}),
     ...(conn.readResponseBytes ? { readResponseBytes: conn.readResponseBytes } : {}),
+    ...(conn.maxRetries !== undefined ? { maxRetries: conn.maxRetries } : {}),
   };
 }
 
@@ -993,6 +996,81 @@ export function encodePath(p: string): string {
   return p.split("/").map(encodeURIComponent).join("/");
 }
 
+/** The typed error for a failed cloud response, carrying what the problem
+ *  body and headers say about retrying. */
+async function cloudError(res: Response, what: string): Promise<SmolError> {
+  const raw = await res.text().catch(() => "");
+  const text = errorSentence(raw);
+  const problem = problemOf(raw);
+  // Surface the server's correlation id (every response carries `x-request-id`)
+  // in the error message — clients see the error body but not headers, so
+  // without this the id is invisible and support can't correlate the call.
+  const rid = res.headers.get("x-request-id");
+  const code =
+    problem.code === "machine_interrupted"
+      ? "MACHINE_INTERRUPTED"
+      : res.status === 404
+        ? "NOT_FOUND"
+        : res.status === 401
+          ? "UNAUTHORIZED"
+          : "SMOLVM_ERROR";
+  return new SmolError(
+    code,
+    `${what} → ${res.status}${text ? `: ${text}` : ""}${rid ? ` [request id: ${rid}]` : ""}`,
+    {
+      status: res.status,
+      problemCode: problem.code,
+      retryable: problem.retryable ?? retryableStatus(res.status),
+      retryAfterMs: retryAfterMs(res.headers.get("retry-after")),
+    },
+  );
+}
+
+/** Retries for a retryable response when the caller sets none. */
+const DEFAULT_CLOUD_RETRIES = 3;
+/** Longest single wait between retries (ms), whatever `Retry-After` asks. */
+const MAX_RETRY_WAIT_MS = 30_000;
+
+/** Parse a `Retry-After` header (delta-seconds or an HTTP date) into ms. */
+export function retryAfterMs(header: string | null, now = Date.now()): number | undefined {
+  if (!header) return undefined;
+  const trimmed = header.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1_000;
+  const at = Date.parse(trimmed);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+}
+
+/** What a failed response's problem body says, beyond its sentence. */
+function problemOf(body: string): { code?: string; retryable?: boolean } {
+  try {
+    const parsed: unknown = JSON.parse(body.trim());
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const fields = parsed as Record<string, unknown>;
+      return {
+        ...(typeof fields.code === "string" ? { code: fields.code } : {}),
+        ...(typeof fields.retryable === "boolean" ? { retryable: fields.retryable } : {}),
+      };
+    }
+  } catch {
+    // Not a problem document.
+  }
+  return {};
+}
+
+/** Statuses the server uses for "try again": rate limited or briefly unavailable. */
+function retryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+/** Whether the SDK may resend a request on its own. A rate-limited request
+ *  never ran, so it is always safe; an unavailable one may have, so only a
+ *  call that is safe to repeat is sent again. */
+export function sdkMayRetry(status: number, method: string, idempotent: boolean): boolean {
+  if (status === 429) return true;
+  if (!retryableStatus(status)) return false;
+  return idempotent || method === "GET" || method === "HEAD" || method === "PUT" || method === "DELETE";
+}
+
 async function cloudFetch<T = unknown>(
   conn: CloudConn,
   method: string,
@@ -1004,7 +1082,57 @@ async function cloudFetch<T = unknown>(
     timeoutMs?: number;
     /** Caller abort; rejects with `signal.reason` rather than TIMEOUT. */
     signal?: AbortSignal | undefined;
+    /** A POST that is safe to send twice (start, stop, resume). */
+    idempotent?: boolean;
   } = {},
+): Promise<T> {
+  const retries = Math.max(0, conn.maxRetries ?? DEFAULT_CLOUD_RETRIES);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await cloudFetchOnce<T>(conn, method, path, opts);
+    } catch (error) {
+      if (
+        !(error instanceof SmolError) ||
+        attempt >= retries ||
+        error.status === undefined ||
+        !sdkMayRetry(error.status, method, opts.idempotent ?? false)
+      ) {
+        throw error;
+      }
+      const backoff = 500 * 2 ** attempt;
+      const wait = Math.min(error.retryAfterMs ?? backoff, MAX_RETRY_WAIT_MS);
+      await sleepUnlessAborted(wait, opts.signal);
+    }
+  }
+}
+
+/** Sleep `ms`, rejecting with the abort reason if `signal` fires first. */
+function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function cloudFetchOnce<T = unknown>(
+  conn: CloudConn,
+  method: string,
+  path: string,
+  opts: {
+    json?: unknown;
+    body?: Buffer;
+    accept?: "json" | "bytes" | "text" | "response";
+    timeoutMs?: number;
+    signal?: AbortSignal | undefined;
+  },
 ): Promise<T> {
   const headers: Record<string, string> = {
     authorization: `Bearer ${conn.apiKey}`,
@@ -1053,21 +1181,7 @@ async function cloudFetch<T = unknown>(
     clearTimeout(timer);
     opts.signal?.removeEventListener("abort", onAbort);
   }
-  if (!res.ok) {
-    const text = errorSentence(await res.text().catch(() => ""));
-    // Surface the server's correlation id (every response carries `x-request-id`)
-    // in the error message — clients see the error body but not headers, so
-    // without this the id is invisible and support can't correlate the call.
-    const rid = res.headers.get("x-request-id");
-    throw new SmolError(
-      res.status === 404
-        ? "NOT_FOUND"
-        : res.status === 401
-          ? "UNAUTHORIZED"
-          : "SMOLVM_ERROR",
-      `cloud ${method} ${path} → ${res.status}${text ? `: ${text}` : ""}${rid ? ` [request id: ${rid}]` : ""}`,
-    );
-  }
+  if (!res.ok) throw await cloudError(res, `cloud ${method} ${path}`);
   if (opts.accept === "response") return res as T;
   if (opts.accept === "text") return (await res.text()) as T;
   if (opts.accept === "bytes") {
@@ -1396,18 +1510,7 @@ class CloudTransport implements Transport {
         `cloud exec/stream failed: ${(e as Error).message}`,
       );
     }
-    if (!res.ok) {
-      const text = errorSentence(await res.text().catch(() => ""));
-      const rid = res.headers.get("x-request-id");
-      throw new SmolError(
-        res.status === 404
-          ? "NOT_FOUND"
-          : res.status === 401
-            ? "UNAUTHORIZED"
-            : "SMOLVM_ERROR",
-        `cloud POST /v1/machines/${this.id}/exec/stream → ${res.status}${text ? `: ${text}` : ""}${rid ? ` [request id: ${rid}]` : ""}`,
-      );
-    }
+    if (!res.ok) throw await cloudError(res, `cloud POST /v1/machines/${this.id}/exec/stream`);
     if (!res.body)
       throw new SmolError(
         "SMOLVM_ERROR",
@@ -1574,7 +1677,7 @@ class CloudTransport implements Transport {
   }
 
   async stop(): Promise<void> {
-    await cloudFetch(this.conn, "POST", `/v1/machines/${this.id}/stop`);
+    await cloudFetch(this.conn, "POST", `/v1/machines/${this.id}/stop`, { idempotent: true });
   }
 
   async pause(): Promise<void> {
@@ -1582,7 +1685,10 @@ class CloudTransport implements Transport {
   }
 
   async resume(waitUntilReady = true): Promise<void> {
-    await cloudFetch(this.conn, "POST", `/v1/machines/${this.id}/resume`, { timeoutMs: CLOUD_START_TIMEOUT_MS });
+    await cloudFetch(this.conn, "POST", `/v1/machines/${this.id}/resume`, {
+      timeoutMs: CLOUD_START_TIMEOUT_MS,
+      idempotent: true,
+    });
     if (waitUntilReady) await waitForReady(this.conn, this.id);
   }
 
@@ -1591,6 +1697,7 @@ class CloudTransport implements Transport {
     // Resume a stopped machine, then wait for its agent so the handle is usable.
     await cloudFetch(this.conn, "POST", `/v1/machines/${this.id}/start`, {
       timeoutMs: CLOUD_START_TIMEOUT_MS,
+      idempotent: true,
     });
     if (waitUntilReady) await waitForReady(this.conn, this.id);
   }
