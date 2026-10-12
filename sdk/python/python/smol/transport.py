@@ -445,6 +445,7 @@ def _native_config(name: str, config: MachineConfig) -> dict:
         "name": name,
         "persistent": config.persistent,
         "forkable": config.forkable,
+        "detached": config.detach,
     }
     if config.image is not None:
         cfg["image"] = config.image
@@ -2318,7 +2319,9 @@ def make_transport(config: MachineConfig, conn: Optional[ConnectOptions] = None)
     transport: Optional[LocalTransport] = None
     try:
         inner = native.Machine(_native_config(name, config))
-        transport = LocalTransport(inner, interceptor=binding)
+        # A detached machine is meant to outlive this process, so the exit
+        # hook that stops this process's machines leaves it running.
+        transport = LocalTransport(inner, cleanup_on_exit=not config.detach, interceptor=binding)
         # A forkable golden boots with memfd-backed guest RAM + a control socket
         # so it can be cloned with Machine.fork (local live-RAM fork).
         if config.forkable:
@@ -2653,8 +2656,10 @@ def list_machines_transport(
                 labels=dict(m.labels),
                 image=m.image,
                 persistent=m.persistent,
+                detached=m.detached,
                 branchable=m.branchable,
                 created_at=datetime.fromtimestamp(m.created_at, timezone.utc).isoformat(),
+                pid=m.pid,
             )
             for m in records
         ]

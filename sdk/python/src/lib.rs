@@ -168,9 +168,13 @@ struct LocalMachineSummary {
     #[pyo3(get)]
     persistent: bool,
     #[pyo3(get)]
+    detached: bool,
+    #[pyo3(get)]
     branchable: bool,
     #[pyo3(get)]
     created_at: u64,
+    #[pyo3(get)]
+    pid: Option<i32>,
 }
 
 /// Result of writing a portable live checkpoint to local disk.
@@ -468,6 +472,10 @@ impl Machine {
             Some(v) if !v.is_none() => v.extract()?,
             _ => false,
         };
+        let detached: bool = match config.get_item("detached")? {
+            Some(value) if !value.is_none() => value.extract()?,
+            _ => false,
+        };
         let forkable: bool = match config.get_item("forkable")? {
             Some(v) if !v.is_none() => v.extract()?,
             _ => false,
@@ -673,6 +681,7 @@ impl Machine {
             allowed_hosts,
             persistent,
             forkable,
+            detached,
             runtime_managed: false,
             remote_volumes,
             credentials,
@@ -753,18 +762,26 @@ impl Machine {
             runtime.list_machines().map(|records| {
                 records
                     .into_iter()
-                    .map(|record| LocalMachineSummary {
-                        state: runtime.state(&record.name),
-                        labels: record
-                            .labels
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        branchable: record.forkable_on_start(),
-                        persistent: !record.ephemeral,
-                        image: record.image,
-                        created_at: record.created_at,
-                        name: record.name,
+                    .map(|record| {
+                        let state = runtime.state(&record.name);
+                        // The record keeps its last PID after the process is
+                        // gone; report one only while the state says it runs.
+                        let pid = record.pid.filter(|_| state == "running");
+                        LocalMachineSummary {
+                            state,
+                            pid,
+                            detached: record.detached,
+                            labels: record
+                                .labels
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                            branchable: record.forkable_on_start(),
+                            persistent: !record.ephemeral,
+                            image: record.image,
+                            created_at: record.created_at,
+                            name: record.name,
+                        }
                     })
                     .collect()
             })

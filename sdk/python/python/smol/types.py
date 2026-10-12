@@ -150,7 +150,16 @@ class MachineConfig:
     no existing config changes meaning. For an allowlist rather than open
     access, set ``resources.allow_hosts`` or ``resources.allow_cidrs``."""
     persistent: bool = False
-    """Keep the machine record after the process exits (local)."""
+    """Keep the machine record after the process exits (local), so a later
+    process can :meth:`Machine.connect` to it. The VM itself still shuts down
+    when this process exits (cleanly, so what it wrote is kept) unless
+    :attr:`detach` is set; ``connect`` boots it again."""
+    detach: bool = False
+    """Keep the VM running after this process exits or crashes (local). Its
+    boot process stops watching this one, and the machine remembers it, so
+    later starts are detached too. A later process reattaches with
+    :meth:`Machine.connect`; stop or delete it when done. Cloud machines always
+    outlive the process that made them."""
     auto_stop_seconds: Optional[int] = None
     """Auto-stop after N idle seconds (cloud)."""
     ttl_seconds: Optional[int] = None
@@ -374,8 +383,12 @@ class MachineSummary:
     labels: dict[str, str]
     image: Optional[str] = None
     persistent: bool = True
+    detached: bool = False
+    """Whether the VM outlives the process that starts it (local)."""
     branchable: bool = False
     created_at: Optional[str] = None
+    pid: Optional[int] = None
+    """Host PID of the VM process while it is running (local)."""
 
 
 @dataclass
