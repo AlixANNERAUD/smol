@@ -106,13 +106,17 @@ for (const triple of triples) {
   for (const lib of platform.libs) {
     if (!existsSync(join(pkgDir, 'native', lib))) fail(`${name}: missing native/${lib}`);
   }
+  // The bundled libraries and rootfs carry their own licenses; bundle-native.sh
+  // writes the notices next to them.
+  if (!existsSync(join(pkgDir, 'native', 'THIRD_PARTY_NOTICES.md'))) fail(`${name}: missing native/THIRD_PARTY_NOTICES.md`);
+  cpSync(resolve('LICENSE'), join(pkgDir, 'LICENSE'));
 
   const manifest = {
     name,
     version: main.version,
     description: `smolmachines local engine for ${platform.label}: native addon, boot helper, hypervisor libraries and guest rootfs. Installed automatically by "${main.name}".`,
     main: addon,
-    files: [addon, 'native'],
+    files: [addon, 'native', 'LICENSE'],
     os: [platform.os],
     cpu: [platform.cpu],
     ...(platform.libc ? { libc: [platform.libc] } : {}),
@@ -126,7 +130,8 @@ for (const triple of triples) {
   writeFileSync(
     join(pkgDir, 'README.md'),
     `# ${name}\n\nThe ${platform.label} local engine for [\`${main.name}\`](https://www.npmjs.com/package/${main.name}). ` +
-      `Do not install this directly — \`npm install ${main.name}\` pulls in the package for your platform.\n`,
+      `Do not install this directly — \`npm install ${main.name}\` pulls in the package for your platform.\n\n` +
+      'It bundles third-party components under their own licenses; see `native/THIRD_PARTY_NOTICES.md`.\n',
   );
   console.log(`assembled ${name}@${main.version} -> ${pkgDir}`);
 }

@@ -236,6 +236,7 @@ jobs:
           SMOLVM_HELPER: ${{ github.workspace }}/__engine__/target/${{ matrix.target }}/release/smolvm
           SMOLVM_ENTITLEMENTS: ${{ github.workspace }}/__engine__/smolvm.entitlements
           SMOLVM_ROOTFS_TAR: ${{ github.workspace }}/rootfs/agent-rootfs.tar
+          SMOLVM_ENGINE_DIR: ${{ github.workspace }}/__engine__
         run: |
           # patchelf: bundle-native.sh strips libkrun's virglrenderer NEEDED (Linux).
           [ "$RUNNER_OS" = "Linux" ] && python3 -m pip install --quiet patchelf || true
@@ -442,6 +443,7 @@ jobs:
           SMOLVM_HELPER: ${{ github.workspace }}/__engine__/target/${{ matrix.target }}/release/smolvm
           SMOLVM_ENTITLEMENTS: ${{ github.workspace }}/__engine__/smolvm.entitlements
           SMOLVM_ROOTFS_TAR: ${{ github.workspace }}/rootfs/agent-rootfs.tar
+          SMOLVM_ENGINE_DIR: ${{ github.workspace }}/__engine__
         run: |
           # patchelf: bundle-native.sh strips libkrun's virglrenderer NEEDED (Linux).
           [ "$RUNNER_OS" = "Linux" ] && python3 -m pip install --quiet patchelf || true

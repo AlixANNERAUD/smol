@@ -217,4 +217,10 @@ if [ "$copied" -eq 0 ]; then
   echo "bundle-native: WARNING — no libkrun/libkrunfw libs found in $LIB_DIR" >&2
   exit 1
 fi
+
+# License texts and notices for everything staged above, shipped in the wheel.
+# The engine checkout supplies the libkrun/libkrunfw pins.
+python3 "$PY_ROOT/../../scripts/third_party_notices.py" "$DEST" \
+  ${SMOLVM_ENGINE_DIR:+--engine "$SMOLVM_ENGINE_DIR"} \
+  $([ -f "$DEST/agent-rootfs.tar" ] && printf -- '--rootfs %s' "$DEST/agent-rootfs.tar")
 echo "bundle-native: staged $copied lib(s) from $LIB_DIR into $DEST"
