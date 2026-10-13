@@ -52,7 +52,7 @@ from .types import (
     ResourceSpec,
 )
 
-__version__ = "1.27.0"
+__version__ = "1.27.2"
 
 __all__ = [
     "Machine",
