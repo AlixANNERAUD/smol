@@ -93,6 +93,28 @@ finally:
 
 Calling `Machine.list()` without a target still lists Cloud machines, as before.
 
+### Keep a local machine across processes
+
+A local machine is tied to the process that starts it. `persistent=True` keeps
+its record, so another process can `Machine.connect` to it, but the VM itself
+shuts down when the process exits: cleanly, so what it wrote is kept, and
+`connect` boots it again. To keep the VM running after the process exits or
+crashes, set `detach=True`; the machine remembers it, and you stop or delete it
+when you are done:
+
+```python
+from smol import ConnectOptions, Machine, MachineConfig
+
+local = ConnectOptions(target="local")
+m = Machine.create(MachineConfig(name="workspace", image="alpine", persistent=True, detach=True), local)
+m.exec(["sh", "-c", "echo hi > /root/note"])
+# ...this process can exit; the VM keeps running...
+
+later = Machine.connect("workspace", local)  # from any process
+print(later.exec(["cat", "/root/note"]).stdout)
+later.delete()
+```
+
 ### Async: `AsyncMachine` (non-blocking)
 
 `Machine` is synchronous — each call blocks the calling thread. When you're

@@ -40,12 +40,12 @@ def test_local_machine_list_reads_shared_db_without_starting_machines():
         SimpleNamespace(
             name="one", state="stopped", labels={"project": "a"},
             image="python:3.12-alpine", persistent=True, branchable=False,
-            created_at=1_700_000_000,
+            created_at=1_700_000_000, detached=True, pid=None,
         ),
         SimpleNamespace(
             name="two", state="running", labels={"project": "b"},
             image=None, persistent=False, branchable=True,
-            created_at=1_700_000_001,
+            created_at=1_700_000_001, detached=False, pid=4242,
         ),
     ]
     native = SimpleNamespace(Machine=SimpleNamespace(list=mock.Mock(return_value=records)))
@@ -60,7 +60,14 @@ def test_local_machine_list_reads_shared_db_without_starting_machines():
     assert filtered[0].state == "stopped" and filtered[0].persistent
     assert filtered[0].created_at.startswith("2023-")
     assert not all_machines[1].persistent and all_machines[1].branchable
+    assert filtered[0].detached and not all_machines[1].detached
+    assert all_machines[1].pid == 4242 and filtered[0].pid is None
     native.Machine.list.assert_called_with()
+
+
+def test_native_config_forwards_detach():
+    assert _native_config("m", MachineConfig(detach=True))["detached"] is True
+    assert _native_config("m", MachineConfig())["detached"] is False
 
 
 def test_native_config_persists_local_labels_for_listing():
