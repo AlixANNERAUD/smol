@@ -1379,10 +1379,26 @@ class CloudTransport:
         _cloud_fetch(self._base, self._key, "POST", f"/v1/machines/{self._id}/stop", idempotent=True)
 
     def ports(self) -> "list[PublishedPort]":
-        raise NotSupportedError("ports() is local-only; the cloud lists them in Machine.list()")
+        m = _cloud_fetch(self._base, self._key, "GET", f"/v1/machines/{self._id}") or {}
+        # A port not placed on a node yet has no host port, reported as 0.
+        return [
+            PublishedPort(guest=p["port"], host=p.get("hostPort") or 0, protocol="tcp")
+            for p in (m.get("ports") or [])
+        ]
 
     def set_ports(self, ports: "list[PublishedPort]") -> None:
-        raise NotSupportedError("publish() and unpublish() are local-only")
+        # The cloud publishes TCP guest ports and picks each one's host port on
+        # the machine's node; clients reach them through connect and the proxy.
+        if any(p.protocol == "udp" for p in ports):
+            raise NotSupportedError("UDP ports are local-only; the cloud publishes TCP ports")
+        guests = list(dict.fromkeys(p.guest for p in ports))
+        _cloud_fetch(
+            self._base,
+            self._key,
+            "PUT",
+            f"/v1/machines/{self._id}/ports",
+            json_body={"ports": [{"port": g} for g in guests]},
+        )
 
     def pack(self, output: str) -> str:
         raise NotSupportedError("pack() is local-only; use checkpoint() on the cloud")

@@ -325,7 +325,7 @@ class AsyncMachine:
         await asyncio.to_thread(self._m.stop, drain_secs, timeout_secs)
 
     async def ports(self) -> "list[PublishedPort]":
-        """The machine's published ports, whether or not it runs. (local)"""
+        """The machine's published ports, whether or not it runs; see :meth:`Machine.ports`."""
         return await asyncio.to_thread(self._m.ports)
 
     async def publish(self, guest: int, host: Optional[int] = None, protocol: str = "tcp") -> PublishedPort:

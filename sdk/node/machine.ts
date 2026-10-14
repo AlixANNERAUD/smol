@@ -459,7 +459,8 @@ export class Machine {
     return this.transport.setNetworkPolicy(policy);
   }
 
-  /** The machine's published ports, whether or not it runs. (local) */
+  /** The machine's published ports, whether or not it runs. On the cloud each
+   *  host port is the node's, and a port not placed yet reports host 0. */
   ports(): Promise<PublishedPort[]> {
     return this.transport.ports();
   }
@@ -468,7 +469,9 @@ export class Machine {
    * Publish a guest port on the host — on a running machine too, without a
    * restart. Without `host`, a free host port is picked. Returns the mapping
    * now in effect. A running machine takes a TCP port now; a UDP port, or a
-   * machine not on virtio-net networking, needs it stopped. (local)
+   * machine not on virtio-net networking, needs it stopped. On the cloud the
+   * machine's node picks the host port (`host` is ignored) and ports are TCP;
+   * reach the port with `connect` or the machine's URL.
    */
   async publish(port: { guest: number; host?: number; protocol?: "tcp" | "udp" }): Promise<PublishedPort> {
     const protocol = port.protocol ?? "tcp";
@@ -477,13 +480,15 @@ export class Machine {
     const mapping: PublishedPort = { host, guest: port.guest, protocol };
     const next = current.filter((p) => !(p.host === host && p.protocol === protocol));
     await this.transport.setPorts([...next, mapping]);
-    return mapping;
+    // Report what took effect: on the cloud the node chose the host port.
+    const now = await this.transport.ports();
+    const same = (p: PublishedPort) => p.guest === port.guest && p.protocol === protocol;
+    return now.find((p) => same(p) && p.host === host) ?? now.find(same) ?? mapping;
   }
 
   /**
    * Stop publishing a port, matched by `guest` port (every host port
    * forwarding to it) or by `host` port. Connections already open carry on.
-   * (local)
    */
   async unpublish(port: { guest?: number; host?: number; protocol?: "tcp" | "udp" }): Promise<void> {
     if (port.guest === undefined && port.host === undefined) {

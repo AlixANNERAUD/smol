@@ -355,7 +355,8 @@ class Handler(BaseHTTPRequestHandler):
             captured["cache_disk_get"] = self.path[len("/v1/cache-disks/"):]
             return self._send(200, json.dumps(cache_disk_info(0)).encode())
         if self.path == f"/v1/machines/{MACHINE_ID}":
-            return self._send(200, json.dumps(readiness_response(MACHINE_ID, 2)).encode())
+            return self._send(200, json.dumps({**readiness_response(MACHINE_ID, 2),
+                                               "ports": captured.get("ports", [])}).encode())
         if self.path == f"/v1/machines/{MACHINE_ID}/checkpoints":
             return self._send(200, json.dumps([{
                 "id": "ckpt-1", "machineId": MACHINE_ID, "status": "available",
@@ -412,6 +413,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith(f"/v1/machines/{MACHINE_ID}/files/"):
             captured["file"] = self._read()
             return self._send(200, b"{}")
+        if self.path == f"/v1/machines/{MACHINE_ID}/ports":
+            asked = json.loads(self._read() or b"{}")
+            captured.setdefault("ports_bodies", []).append(asked)
+            # The node picks host ports; a kept port keeps its own.
+            current = captured.get("ports", [])
+            captured["ports"] = [
+                {"port": p["port"],
+                 "hostPort": next((c["hostPort"] for c in current if c["port"] == p["port"]),
+                                  31000 + len(current) + i)}
+                for i, p in enumerate(asked["ports"])
+            ]
+            return self._send(200, json.dumps({"id": MACHINE_ID, "state": "started",
+                                               "ports": captured["ports"]}).encode())
         if self.path.startswith("/v1/credentials/"):
             captured.setdefault("credential_puts", []).append(
                 {"name": self.path[len("/v1/credentials/"):], "body": json.loads(self._read() or b"{}")}
@@ -613,6 +627,25 @@ def main() -> int:
             check("resize refuses overlay_gb on the cloud", False, "did not raise")
         except SmolError:
             check("resize refuses overlay_gb on the cloud", True)
+
+        # --- ports: publish and unpublish on the running machine ---
+        port = m.publish(3000, host=9999)
+        check("publish sends the guest port to PUT /ports",
+              captured["ports_bodies"][-1] == {"ports": [{"port": 3000}]}, str(captured.get("ports_bodies")))
+        check("publish returns the host port the node picked, not the one asked for",
+              (port.guest, port.host, port.protocol) == (3000, 31000, "tcp"), str(port))
+        m.publish(8080)
+        listed = m.ports()
+        check("ports lists both, and 3000 kept its host port",
+              len(listed) == 2 and any(p.guest == 3000 and p.host == 31000 for p in listed), str(listed))
+        try:
+            m.publish(53, protocol="udp")
+            check("publish refuses UDP on the cloud", False, "did not raise")
+        except SmolError:
+            check("publish refuses UDP on the cloud", True)
+        m.unpublish(guest=3000)
+        check("unpublish sends the remaining set",
+              captured["ports_bodies"][-1] == {"ports": [{"port": 8080}]}, str(captured["ports_bodies"][-1]))
 
         # --- branch: live-RAM child over the cloud ---
         clone = m.branch(

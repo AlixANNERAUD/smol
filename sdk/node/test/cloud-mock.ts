@@ -29,6 +29,8 @@ const seen: any = { auth: null, execBody: null, execBodies: [] as any[] };
 // does; one that predates the field silently drops it and echoes nothing).
 let echoUser = true;
 const files = new Map<string, Buffer>();
+// m1's published ports as the control plane stores them: the node picks host ports.
+let m1Ports: { port: number; hostPort: number }[] = [];
 const readinessGets: Record<string, number> = {};
 
 function readinessResponse(id: string, readyAfter: number, state = "started") {
@@ -383,7 +385,16 @@ const server = createServer(async (req, res) => {
     );
   }
   if (method === "GET" && url === "/v1/machines/m1")
-    return json(200, readinessResponse("m1", 2));
+    return json(200, { ...readinessResponse("m1", 2), ports: m1Ports });
+  if (method === "PUT" && url === "/v1/machines/m1/ports") {
+    seen.portsBodies = [...(seen.portsBodies ?? []), JSON.parse((await readBody(req)).toString() || "{}")];
+    const asked: { port: number }[] = seen.portsBodies.at(-1).ports;
+    m1Ports = asked.map((p, i) => ({
+      port: p.port,
+      hostPort: m1Ports.find((c) => c.port === p.port)?.hostPort ?? 31000 + m1Ports.length + i,
+    }));
+    return json(200, { id: "m1", name: "golden", state: "started", ports: m1Ports });
+  }
   if (method === "GET" && url === "/v1/machines/m-restored")
     return json(200, { id: "m-restored", state: "running", ready: true });
   if (method === "GET" && url === "/v1/machines/m-wait")
@@ -971,6 +982,39 @@ async function main(): Promise<void> {
     overlayRefused = e instanceof SmolError;
   }
   check("resize refuses overlayGb on the cloud", overlayRefused);
+
+  // --- ports: publish and unpublish on the running machine ---
+  const publishedPort = await m.publish({ guest: 3000, host: 9999 });
+  check(
+    "publish sends the guest port to PUT /ports",
+    JSON.stringify(seen.portsBodies?.at(-1)) === JSON.stringify({ ports: [{ port: 3000 }] }),
+    JSON.stringify(seen.portsBodies),
+  );
+  check(
+    "publish returns the host port the node picked, not the one asked for",
+    publishedPort.guest === 3000 && publishedPort.host === 31000 && publishedPort.protocol === "tcp",
+    JSON.stringify(publishedPort),
+  );
+  await m.publish({ guest: 8080 });
+  const portList = await m.ports();
+  check(
+    "ports lists both, and 3000 kept its host port",
+    portList.length === 2 && portList.some((p) => p.guest === 3000 && p.host === 31000) && portList.some((p) => p.guest === 8080),
+    JSON.stringify(portList),
+  );
+  let udpRefused = false;
+  try {
+    await m.publish({ guest: 53, protocol: "udp" });
+  } catch (e) {
+    udpRefused = e instanceof SmolError;
+  }
+  check("publish refuses UDP on the cloud", udpRefused);
+  await m.unpublish({ guest: 3000 });
+  check(
+    "unpublish sends the remaining set",
+    JSON.stringify(seen.portsBodies?.at(-1)) === JSON.stringify({ ports: [{ port: 8080 }] }),
+    JSON.stringify(seen.portsBodies?.at(-1)),
+  );
 
   // --- branch batch: fan out N children in one transactional call ---
   const batch = await m.branchBatch({ count: 3, namePrefix: "rollout" });

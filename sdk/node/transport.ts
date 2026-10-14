@@ -85,6 +85,12 @@ type MachineInfo = Schemas["MachineInfo"] & {
   ports?: { port: number; hostPort?: number | null }[] | null;
 };
 
+/** A cloud machine's published ports, as the SDK reports ports everywhere. A
+ *  port not placed on a node yet has no host port, reported as 0. */
+function cloudPorts(m: MachineInfo): PublishedPort[] {
+  return (m.ports ?? []).map((p) => ({ host: p.hostPort ?? 0, guest: p.port, protocol: "tcp" as const }));
+}
+
 /** Raw exec result (the ergonomic wrapper is added in machine.ts). */
 export interface RawExec {
   /** The detached process's pid, for a background exec. */
@@ -152,9 +158,9 @@ export interface Transport {
   readonly machineId: string;
   sync(): Promise<void>;
   setNetworkPolicy(policy: NetworkPolicy): Promise<void>;
-  /** Published ports, whether or not the machine runs. (local) */
+  /** Published ports, whether or not the machine runs. */
   ports(): Promise<PublishedPort[]>;
-  /** Replace the published ports. (local) */
+  /** Replace the published ports. The cloud takes TCP guest ports and picks host ports. */
   setPorts(ports: PublishedPort[]): Promise<void>;
   /** Pack the stopped machine into a `.smolmachine`. (local) */
   pack(output: string): Promise<string>;
@@ -1748,11 +1754,20 @@ class CloudTransport implements Transport {
   }
 
   async ports(): Promise<PublishedPort[]> {
-    throw new NotSupportedError("ports() is local-only; the cloud lists them in Machine.list().");
+    const m = await cloudFetch<MachineInfo>(this.conn, "GET", `/v1/machines/${this.id}`);
+    return cloudPorts(m);
   }
 
-  async setPorts(): Promise<void> {
-    throw new NotSupportedError("publish() and unpublish() are local-only.");
+  async setPorts(ports: PublishedPort[]): Promise<void> {
+    // The cloud publishes TCP guest ports and picks each one's host port on the
+    // machine's node; clients reach them through connect, tunnel and the proxy.
+    if (ports.some((p) => p.protocol === "udp")) {
+      throw new NotSupportedError("UDP ports are local-only; the cloud publishes TCP ports.");
+    }
+    const guests = [...new Set(ports.map((p) => p.guest))];
+    await cloudFetch<MachineInfo>(this.conn, "PUT", `/v1/machines/${this.id}/ports`, {
+      json: { ports: guests.map((port) => ({ port })) },
+    });
   }
 
   async pack(): Promise<string> {
