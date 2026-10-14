@@ -32,9 +32,12 @@ boots a microVM with no separate install. The cloud transport needs only a token
 import { Machine } from 'smolmachines';
 
 // Local — boots an in-process microVM, no server.
-const m = await Machine.create({ resources: { cpus: 2, memoryMb: 1024, network: true } });
+const m = await Machine.create({
+  image: 'python:3.12',
+  resources: { cpus: 2, memoryMb: 1024, network: true },
+});
 try {
-  const r = await m.run('python:3.12', ['python', '-c', 'print(2 ** 10)']);
+  const r = await m.exec(['python', '-c', 'print(2 ** 10)']);
   await m.writeFile('/workspace/in.txt', 'hi');
 } finally {
   await m.delete();
@@ -50,8 +53,9 @@ const c = await Machine.create({ image: 'alpine:3.20' }, { target: 'cloud' });
 from smol import Machine, MachineConfig, ResourceSpec, ConnectOptions
 
 # Context-managed: auto-deletes on exit.
-with Machine.create(MachineConfig(resources=ResourceSpec(cpus=2, memory_mb=1024, network=True))) as m:
-    r = m.run("python:3.12", ["python", "-c", "print(2 ** 10)"]).assert_success()
+config = MachineConfig(image="python:3.12", resources=ResourceSpec(cpus=2, memory_mb=1024, network=True))
+with Machine.create(config) as m:
+    r = m.exec(["python", "-c", "print(2 ** 10)"]).assert_success()
 
 m = Machine.create(MachineConfig(image="alpine:3.20"), ConnectOptions(target="cloud"))
 ```

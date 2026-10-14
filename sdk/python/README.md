@@ -33,8 +33,11 @@ from smol import Machine, MachineConfig, ResourceSpec
 # Local — no server. The SDK is in your process; the VMM is a separate,
 # seccomp/Landlock-confined helper. For local images, pass a Docker/OCI
 # save archive path or an unpacked rootfs directory as MachineConfig(image=...).
-with Machine.create(MachineConfig(resources=ResourceSpec(cpus=2, memory_mb=1024, network=True))) as m:
-    res = m.run("python:3.12", ["python", "-c", "print(2 ** 10)"])
+# The image is pulled once; later machines of the same image start from it in
+# about a second.
+config = MachineConfig(image="python:3.12", resources=ResourceSpec(cpus=2, memory_mb=1024, network=True))
+with Machine.create(config) as m:
+    res = m.exec(["python", "-c", "print(2 ** 10)"])
     res.assert_success()
     print(res.stdout)            # 1024
     m.write_file("/tmp/in.txt", "hi")
