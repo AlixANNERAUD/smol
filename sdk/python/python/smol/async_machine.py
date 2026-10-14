@@ -48,6 +48,7 @@ from .types import (
     MachineResources,
     PortEndpoint,
     PortSpec,
+    PublishedPort,
 )
 
 __all__ = ["AsyncMachine"]
@@ -91,6 +92,20 @@ class AsyncMachine:
         before doing work."""
         m = await asyncio.to_thread(Machine.connect, machine_id, conn)
         return cls(m)
+
+    @classmethod
+    async def open(cls, machine_id: str, conn: Optional[ConnectOptions] = None) -> "AsyncMachine":
+        """Open a handle to an EXISTING machine without starting it; see
+        :meth:`Machine.open`."""
+        return cls(await asyncio.to_thread(Machine.open, machine_id, conn))
+
+    @staticmethod
+    async def delete_by_name(
+        machine_id: str, conn: Optional[ConnectOptions] = None, drain_secs: Optional[float] = None
+    ) -> None:
+        """Delete a machine by name without booting it; see
+        :meth:`Machine.delete_by_name`."""
+        await asyncio.to_thread(Machine.delete_by_name, machine_id, conn, drain_secs)
 
     @classmethod
     async def restore_checkpoint(
@@ -305,9 +320,27 @@ class AsyncMachine:
         """Copy guest-local staged mounts back to their host directories without stopping."""
         await asyncio.to_thread(self._m.sync)
 
-    async def stop(self) -> None:
-        """Stop the machine."""
-        await asyncio.to_thread(self._m.stop)
+    async def stop(self, drain_secs: Optional[float] = None, timeout_secs: Optional[float] = None) -> None:
+        """Stop the machine; see :meth:`Machine.stop`."""
+        await asyncio.to_thread(self._m.stop, drain_secs, timeout_secs)
+
+    async def ports(self) -> "list[PublishedPort]":
+        """The machine's published ports, whether or not it runs. (local)"""
+        return await asyncio.to_thread(self._m.ports)
+
+    async def publish(self, guest: int, host: Optional[int] = None, protocol: str = "tcp") -> PublishedPort:
+        """Publish a guest port on the host; see :meth:`Machine.publish`."""
+        return await asyncio.to_thread(self._m.publish, guest, host, protocol)
+
+    async def unpublish(
+        self, guest: Optional[int] = None, host: Optional[int] = None, protocol: str = "tcp"
+    ) -> None:
+        """Stop publishing a port; see :meth:`Machine.unpublish`."""
+        await asyncio.to_thread(self._m.unpublish, guest, host, protocol)
+
+    async def pack(self, path: str) -> str:
+        """Pack this stopped machine into a ``.smolmachine``; see :meth:`Machine.pack`."""
+        return await asyncio.to_thread(self._m.pack, path)
 
     async def pause(self) -> None:
         """Save RAM and disk durably, then stop."""
@@ -324,11 +357,13 @@ class AsyncMachine:
         counterpart to :meth:`stop`; disk state is preserved across the cycle."""
         await asyncio.to_thread(self._m.start, egress_interceptor, wait_until_ready)
 
-    async def delete(self, include_usage: bool = False) -> Optional[MachineUsageReport]:
+    async def delete(
+        self, include_usage: bool = False, drain_secs: Optional[float] = None
+    ) -> Optional[MachineUsageReport]:
         """Stop the machine and delete its storage. On the cloud target, pass
         ``include_usage=True`` to also get the fully settled usage + cost back
         in one call."""
-        return await asyncio.to_thread(self._m.delete, include_usage)
+        return await asyncio.to_thread(self._m.delete, include_usage, drain_secs)
 
     async def usage(self) -> MachineUsageReport:
         """Metered usage + cost for this machine (cloud target); readable up to

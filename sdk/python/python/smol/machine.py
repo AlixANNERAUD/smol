@@ -22,6 +22,8 @@ from .transport import (
     Transport,
     _load_native,
     connect_transport,
+    delete_machine_transport,
+    open_transport,
     create_cache_disk,
     delete_cache_disk,
     get_cache_disk,
@@ -32,7 +34,7 @@ from .transport import (
     restore_checkpoint_transport,
     upload_checkpoint,
 )
-from .errors import NotSupportedError, SmolError, wrap_native_error
+from .errors import InvalidConfigError, NotSupportedError, SmolError, wrap_native_error
 from .types import (
     JobInfo,
     JobOutput,
@@ -52,9 +54,19 @@ from .types import (
     MachineResources,
     PortEndpoint,
     PortSpec,
+    PublishedPort,
 )
 
 __all__ = ["Machine"]
+
+
+def _free_host_port() -> int:
+    """A host port free right now on loopback, for a publish that names none."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 class Machine:
@@ -146,6 +158,28 @@ class Machine:
         paused machine's saved execution, is refused until that machine is gone.
         """
         delete_checkpoint_transport(checkpoint_id, conn)
+
+    @classmethod
+    def open(cls, machine_id: str, conn: Optional[ConnectOptions] = None) -> "Machine":
+        """Open a handle to an EXISTING machine without starting it or waiting
+        for it — to describe, stop, resize or delete it, including one that can
+        no longer boot. ``state()`` reports ``"stopped"`` for a stopped one;
+        :meth:`start` boots it.
+
+        * local: by name; raises ``SmolError`` with code ``NOT_FOUND`` when
+          none exists.
+        * cloud: by id, as :meth:`connect`.
+        """
+        return cls(open_transport(machine_id, conn))
+
+    @staticmethod
+    def delete_by_name(
+        machine_id: str, conn: Optional[ConnectOptions] = None, drain_secs: Optional[float] = None
+    ) -> None:
+        """Delete a machine by name (cloud: id) without a handle and without
+        booting it, running or not. Deleting one that does not exist succeeds.
+        ``drain_secs`` lets running commands and transfers finish first (local)."""
+        delete_machine_transport(machine_id, conn, drain_secs)
 
     @staticmethod
     def list(
@@ -392,9 +426,58 @@ class Machine:
         """Copy guest-local staged mounts back to their host directories without stopping."""
         self._t.sync()
 
-    def stop(self) -> None:
-        """Stop the machine."""
-        self._t.stop()
+    def stop(self, drain_secs: Optional[float] = None, timeout_secs: Optional[float] = None) -> None:
+        """Stop the machine. Its workload is sent its stop signal and given its
+        stop timeout (``timeout_secs`` overrides it; ``0`` kills at once) to
+        save state and exit first. A command or file transfer still running
+        raises ``SmolError`` code ``INTERRUPTED`` unless ``drain_secs`` lets it
+        finish; new ones are refused while the stop runs. (options: local)"""
+        self._t.stop(drain_secs, timeout_secs)
+
+    def ports(self) -> "list[PublishedPort]":
+        """The machine's published ports, whether or not it runs. (local)"""
+        return self._t.ports()
+
+    def publish(
+        self, guest: int, host: Optional[int] = None, protocol: str = "tcp"
+    ) -> PublishedPort:
+        """Publish a guest port on the host — on a running machine too,
+        without a restart. Without ``host``, a free host port is picked.
+        Returns the mapping now in effect. A running machine takes a TCP port
+        now; a UDP port, or a machine not on virtio-net, needs it stopped.
+        (local)"""
+        if protocol not in ("tcp", "udp"):
+            raise InvalidConfigError(f"unknown port protocol {protocol!r}: use tcp or udp")
+        mapping = PublishedPort(guest=guest, host=host or _free_host_port(), protocol=protocol)  # type: ignore[arg-type]
+        current = [p for p in self._t.ports() if not (p.host == mapping.host and p.protocol == protocol)]
+        self._t.set_ports([*current, mapping])
+        return mapping
+
+    def unpublish(
+        self, guest: Optional[int] = None, host: Optional[int] = None, protocol: str = "tcp"
+    ) -> None:
+        """Stop publishing a port, matched by ``guest`` port (every host port
+        forwarding to it) or by ``host`` port. Connections already open carry
+        on. (local)"""
+        if guest is None and host is None:
+            raise InvalidConfigError("unpublish needs a guest or a host port")
+        current = self._t.ports()
+        keep = [
+            p
+            for p in current
+            if p.protocol != protocol
+            or (guest is not None and p.guest != guest)
+            or (host is not None and p.host != host)
+        ]
+        if len(keep) != len(current):
+            self._t.set_ports(keep)
+
+    def pack(self, path: str) -> str:
+        """Pack this stopped machine into a ``.smolmachine`` at ``path``: its
+        disks and configuration in one artifact that stays on this host.
+        Create machines from it with ``Machine.create(MachineConfig(image=path))``.
+        Returns the artifact's path. (local)"""
+        return self._t.pack(path)
 
     def start(
         self, egress_interceptor: Optional[EgressInterceptor] = None, wait_until_ready: bool = True
@@ -412,14 +495,16 @@ class Machine:
         """Resume saved execution in this machine."""
         self._t.resume(wait_until_ready)
 
-    def delete(self, include_usage: bool = False) -> Optional[MachineUsageReport]:
+    def delete(
+        self, include_usage: bool = False, drain_secs: Optional[float] = None
+    ) -> Optional[MachineUsageReport]:
         """Stop the machine and delete its storage. On the cloud target, pass
         ``include_usage=True`` to also get the fully settled usage + cost back
         in one call — the control plane takes a final metering sample before
         teardown, so nothing accrues after the returned report."""
         if include_usage:
             return self._t.delete_with_usage()
-        self._t.delete()
+        self._t.delete(drain_secs)
         return None
 
     def usage(self) -> MachineUsageReport:

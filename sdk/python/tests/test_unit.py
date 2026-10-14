@@ -19,6 +19,7 @@ from smol.errors import (  # noqa: E402
 from smol.rollout import RolloutClient, RolloutError, adapter_sha256  # noqa: E402
 from smol import transport as transport_module  # noqa: E402
 from smol import machine as machine_module  # noqa: E402
+from smol.types import MachineSizes, PublishedPort  # noqa: E402
 from smol.transport import (  # noqa: E402
     _cli_config_api_key,
     _encode_path,
@@ -41,11 +42,13 @@ def test_local_machine_list_reads_shared_db_without_starting_machines():
             name="one", state="stopped", labels={"project": "a"},
             image="python:3.12-alpine", persistent=True, branchable=False,
             created_at=1_700_000_000, detached=True, pid=None,
+            cpus=2, memory_mib=2048, storage_gib=8, ports=[(18080, 3000, "tcp"), (17777, 7777, "udp")],
         ),
         SimpleNamespace(
             name="two", state="running", labels={"project": "b"},
             image=None, persistent=False, branchable=True,
             created_at=1_700_000_001, detached=False, pid=4242,
+            cpus=4, memory_mib=8192, storage_gib=20, ports=[],
         ),
     ]
     native = SimpleNamespace(Machine=SimpleNamespace(list=mock.Mock(return_value=records)))
@@ -62,6 +65,12 @@ def test_local_machine_list_reads_shared_db_without_starting_machines():
     assert not all_machines[1].persistent and all_machines[1].branchable
     assert filtered[0].detached and not all_machines[1].detached
     assert all_machines[1].pid == 4242 and filtered[0].pid is None
+    assert filtered[0].resources == MachineSizes(cpus=2, memory_mib=2048, storage_gib=8)
+    assert filtered[0].ports == [
+        PublishedPort(guest=3000, host=18080, protocol="tcp"),
+        PublishedPort(guest=7777, host=17777, protocol="udp"),
+    ]
+    assert all_machines[1].ports == []
     native.Machine.list.assert_called_with()
 
 
