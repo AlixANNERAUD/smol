@@ -15,6 +15,7 @@
 #   PREFIX                       where the bundle lives (default: ~/.smol)
 #   BIN_DIR                      where the `smol` symlink goes (default: ~/.local/bin)
 #   GITHUB_TOKEN                 optional, raises the GitHub API rate limit for "latest"
+#   SMOL_NO_MODIFY_PATH=1        do not add BIN_DIR to your shell's startup file
 #   SMOL_INSECURE_SKIP_CHECKSUM=1  install without verifying the checksum (NOT recommended)
 #
 # The whole body runs inside main(), invoked on the LAST line, so a truncated
@@ -144,7 +145,7 @@ main() {
   fi
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
-    *) echo ">> add $BIN_DIR to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
+    *) add_to_path "$BIN_DIR" ;;
   esac
 
   # ── warn about OTHER smol binaries shadowing this one ─────────────────────
@@ -169,6 +170,51 @@ main() {
     echo "   remove it:  rm '$shadow'   then run:  hash -r"
   fi
   echo ">> done — try:  smol run -I alpine --net -- cat /etc/os-release"
+}
+
+# Put BIN_DIR on PATH for future shells, as rustup and bun do: one marked line
+# in the startup file of the user's shell, added once. The running shell is a
+# parent of `curl | bash` and cannot be changed from here, so say how to use
+# smol right now too. SMOL_NO_MODIFY_PATH=1 keeps every file untouched.
+add_to_path() {
+  local dir="$1" marker="# added by the smol installer" display rc line
+  display="$dir"
+  case "$dir" in "$HOME"/*) display="\$HOME${dir#"$HOME"}" ;; esac
+  local now=">> to use smol in this shell now:  export PATH=\"$display:\$PATH\""
+  if [ "${SMOL_NO_MODIFY_PATH:-}" = 1 ]; then
+    echo ">> add $dir to your PATH:  export PATH=\"$display:\$PATH\""
+    return
+  fi
+  local files=()
+  case "$(basename "${SHELL:-}")" in
+    zsh) files=("${ZDOTDIR:-$HOME}/.zshrc") ;;
+    bash)
+      files=("$HOME/.bashrc")
+      # macOS Terminal starts bash as a login shell, which reads .bash_profile.
+      [ "$(uname -s)" = Darwin ] && files+=("$HOME/.bash_profile")
+      ;;
+    fish) files=("${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/smol.fish") ;;
+    *) files=("$HOME/.profile") ;;
+  esac
+  local added=()
+  for rc in "${files[@]}"; do
+    case "$rc" in
+      *.fish) line="fish_add_path \"$display\"" ;;
+      *) line="export PATH=\"$display:\$PATH\"" ;;
+    esac
+    if [ -f "$rc" ] && grep -qF "$marker" "$rc" 2>/dev/null; then
+      continue
+    fi
+    if mkdir -p "$(dirname "$rc")" 2>/dev/null && printf '\n%s\n%s\n' "$marker" "$line" >>"$rc" 2>/dev/null; then
+      added+=("$rc")
+    else
+      echo ">> could not update $rc; add $dir to your PATH yourself"
+    fi
+  done
+  if [ "${#added[@]}" -gt 0 ]; then
+    echo ">> added $dir to your PATH in ${added[*]} (opt out: SMOL_NO_MODIFY_PATH=1)"
+  fi
+  echo "$now"
 }
 
 main "$@"
