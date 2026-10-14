@@ -39,6 +39,18 @@ pub struct ForkCmd {
     pub share_weights: bool,
 }
 
+/// A branch pins TCP host ports only; the engine gives each UDP forward
+/// a fresh host port, so a `/udp` pin is refused rather than ignored.
+pub(super) fn tcp_pins(ports: &[PortMapping]) -> anyhow::Result<Vec<(u16, u16)>> {
+    if let Some(udp) = ports.iter().find(|port| !port.protocol.is_tcp()) {
+        anyhow::bail!(
+            "{} cannot be pinned: a branch pins TCP ports, and gets fresh host ports for UDP forwards automatically",
+            udp.label()
+        );
+    }
+    Ok(PortMapping::to_tuples(ports))
+}
+
 fn cloud_branch_body(
     clone_name: &str,
     ports: &[PortMapping],
@@ -74,7 +86,7 @@ impl ForkCmd {
             return self.run_cloud();
         }
 
-        let pinned = PortMapping::to_tuples(&self.port);
+        let pinned = tcp_pins(&self.port)?;
         let db = smolvm::db::SmolvmDb::open()?;
         let runtime = smolvm::embedded::EmbeddedRuntime::with_db(db.clone());
         if self.forkable {
@@ -89,6 +101,9 @@ impl ForkCmd {
         for (host, guest) in &clone.ports {
             eprintln!("  port {host}->{guest}");
         }
+        for (host, guest) in &clone.udp_ports {
+            eprintln!("  port {host}->{guest}/udp");
+        }
         eprintln!(
             "Branched '{}' -> '{}' (PID {}).",
             self.golden,
@@ -99,6 +114,7 @@ impl ForkCmd {
     }
 
     fn run_cloud(self) -> anyhow::Result<()> {
+        tcp_pins(&self.port)?;
         let clone_name = self.name.clone();
         let body = cloud_branch_body(&clone_name, &self.port, self.share_weights, self.forkable);
         super::cloud::run_cloud_command(
