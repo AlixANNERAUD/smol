@@ -224,6 +224,10 @@ class ExecOptions:
     the SDK first checks that the control plane applies it and raises
     :class:`NotSupportedError` before running anything if it would not. Not
     supported by local ``run(image, ...)``."""
+    stdin: Optional[str | bytes] = None
+    """Text written to the command's stdin, which is then closed. Passed over
+    the agent connection and never written to the machine's disk, so it can
+    carry a script or a secret. ``bytes`` must be UTF-8."""
     output: Optional[Literal["text", "b64", "both"]] = None
     """Cloud target only: which output encodings the server returns. The default
     carries both the capped UTF-8 text fields and the byte-exact base64 fields;
@@ -374,6 +378,25 @@ class ConnectOptions:
 
 
 @dataclass
+class MachineSizes:
+    """CPU, memory and disk sizes of a machine, as ``Machine.list()`` reports them."""
+
+    cpus: int
+    memory_mib: int
+    storage_gib: int
+
+
+@dataclass
+class PublishedPort:
+    """A published port. ``host`` is the host port forwarding to ``guest``; on
+    the cloud it is the node port, set once the machine is placed."""
+
+    guest: int
+    host: Optional[int] = None
+    protocol: Literal["tcp", "udp"] = "tcp"
+
+
+@dataclass
 class MachineSummary:
     """One machine as :meth:`Machine.list` reports it."""
 
@@ -388,6 +411,10 @@ class MachineSummary:
     branchable: bool = False
     created_at: Optional[str] = None
     pid: Optional[int] = None
+    resources: Optional["MachineSizes"] = None
+    """CPU, memory and disk sizes, whether or not the machine runs."""
+    ports: Optional[list["PublishedPort"]] = None
+    """Published ports, whether or not the machine runs."""
     """Host PID of the VM process while it is running (local)."""
 
 

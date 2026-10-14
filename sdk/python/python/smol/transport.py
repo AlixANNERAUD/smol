@@ -51,8 +51,10 @@ from .types import (
     ShareLink,
     PortableCheckpointInfo,
     MachineResources,
+    MachineSizes,
     PortEndpoint,
     PortSpec,
+    PublishedPort,
 )
 
 DEFAULT_CLOUD_URL = "https://api.smolmachines.com"
@@ -152,12 +154,15 @@ class Transport(Protocol):
     def write_file(self, path: str, data: bytes, mode: Optional[int] = None) -> None: ...
     def pull_image(self, image: str) -> ImageInfo: ...
     def list_images(self) -> list[ImageInfo]: ...
-    def stop(self) -> None: ...
+    def stop(self, drain_secs: Optional[float] = None, timeout_secs: Optional[float] = None) -> None: ...
+    def ports(self) -> "list[PublishedPort]": ...
+    def set_ports(self, ports: "list[PublishedPort]") -> None: ...
+    def pack(self, output: str) -> str: ...
     def pause(self) -> None: ...
     def resume(self, wait_until_ready: bool = True) -> None: ...
     def sync(self) -> None: ...
     def start(self, interceptor: Optional[EgressInterceptor] = None, wait_until_ready: bool = True) -> None: ...
-    def delete(self) -> None: ...
+    def delete(self, drain_secs: Optional[float] = None) -> None: ...
     def delete_with_usage(self) -> MachineUsageReport: ...
     def usage(self) -> MachineUsageReport: ...
     def share(self) -> ShareLink: ...
@@ -403,7 +408,30 @@ def _native_exec_options(opts: Optional[ExecOptions]) -> Optional[dict]:
         out["user"] = opts.user
     if opts.env is not None:
         out["env"] = [{"key": k, "value": v} for k, v in opts.env.items()]
+    if opts.stdin is not None:
+        out["stdin"] = _stdin_text(opts.stdin)
     return out
+
+
+def _stdin_text(stdin: "str | bytes") -> str:
+    """``ExecOptions.stdin`` as the text the agent protocol carries."""
+    if isinstance(stdin, str):
+        return stdin
+    try:
+        return stdin.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise InvalidConfigError("exec stdin must be UTF-8 text") from e
+
+
+def _refuse_cloud_stop_options(drain_secs: Optional[float], timeout_secs: Optional[float]) -> None:
+    """The cloud stop and delete take no drain or stop timeout yet; say so
+    rather than ignore them."""
+    if drain_secs is not None or timeout_secs is not None:
+        raise NotSupportedError("drain_secs and timeout_secs are local-only")
+
+
+def _ports_from_native(ports: "list[tuple[int, int, str]]") -> "list[PublishedPort]":
+    return [PublishedPort(guest=g, host=h, protocol="udp" if p == "udp" else "tcp") for h, g, p in ports]
 
 
 def _store_cloud_credentials(
@@ -798,10 +826,31 @@ class LocalTransport:
         except Exception as e:  # noqa: BLE001
             raise wrap_native_error(e) from e
 
-    def stop(self) -> None:
+    def stop(self, drain_secs: Optional[float] = None, timeout_secs: Optional[float] = None) -> None:
         _live_local.discard(self)
         try:
-            self._inner.stop()
+            self._inner.stop(drain_secs, timeout_secs)
+        except Exception as e:  # noqa: BLE001
+            raise wrap_native_error(e) from e
+
+    def ports(self) -> "list[PublishedPort]":
+        try:
+            return _ports_from_native(self._inner.published_ports())
+        except Exception as e:  # noqa: BLE001
+            raise wrap_native_error(e) from e
+
+    def set_ports(self, ports: "list[PublishedPort]") -> None:
+        for p in ports:
+            if p.host is None:
+                raise InvalidConfigError(f"port {p.guest} has no host port")
+        try:
+            self._inner.set_ports([(p.host, p.guest, p.protocol) for p in ports])
+        except Exception as e:  # noqa: BLE001
+            raise wrap_native_error(e) from e
+
+    def pack(self, output: str) -> str:
+        try:
+            return self._inner.pack(os.path.abspath(output))
         except Exception as e:  # noqa: BLE001
             raise wrap_native_error(e) from e
 
@@ -838,10 +887,10 @@ class LocalTransport:
         if wait_until_ready:
             self.wait_until_ready()
 
-    def delete(self) -> None:
+    def delete(self, drain_secs: Optional[float] = None) -> None:
         _live_local.discard(self)
         try:
-            self._inner.delete()
+            self._inner.delete(drain_secs)
         except Exception as e:  # noqa: BLE001
             raise wrap_native_error(e) from e
 
@@ -1043,6 +1092,8 @@ class CloudTransport:
             body["user"] = opts.user
         if opts is not None and opts.background:
             body["background"] = True
+        if opts is not None and opts.stdin is not None:
+            body["stdin"] = _stdin_text(opts.stdin)
         return body
 
     def _ensure_user(self, user: str) -> None:
@@ -1323,8 +1374,18 @@ class CloudTransport:
             "sync() is local-only because cloud machines cannot carry host-directory mounts."
         )
 
-    def stop(self) -> None:
+    def stop(self, drain_secs: Optional[float] = None, timeout_secs: Optional[float] = None) -> None:
+        _refuse_cloud_stop_options(drain_secs, timeout_secs)
         _cloud_fetch(self._base, self._key, "POST", f"/v1/machines/{self._id}/stop", idempotent=True)
+
+    def ports(self) -> "list[PublishedPort]":
+        raise NotSupportedError("ports() is local-only; the cloud lists them in Machine.list()")
+
+    def set_ports(self, ports: "list[PublishedPort]") -> None:
+        raise NotSupportedError("publish() and unpublish() are local-only")
+
+    def pack(self, output: str) -> str:
+        raise NotSupportedError("pack() is local-only; use checkpoint() on the cloud")
 
     def pause(self) -> None:
         _cloud_fetch(self._base, self._key, "POST", f"/v1/machines/{self._id}/pause", timeout=CLOUD_START_TIMEOUT_S)
@@ -1434,7 +1495,8 @@ class CloudTransport:
         if wait_until_ready:
             _wait_for_ready(self._base, self._key, self._id)
 
-    def delete(self) -> None:
+    def delete(self, drain_secs: Optional[float] = None) -> None:
+        _refuse_cloud_stop_options(drain_secs, None)
         _cloud_fetch(self._base, self._key, "DELETE", f"/v1/machines/{self._id}")
 
     def delete_with_usage(self) -> MachineUsageReport:
@@ -2317,6 +2379,25 @@ def make_transport(config: MachineConfig, conn: Optional[ConnectOptions] = None)
     native = _load_native()
     name = config.name or _generate_name()
     transport: Optional[LocalTransport] = None
+    if config.image is not None and config.image.endswith(".smolmachine"):
+        # A packed machine: create from it (as `smolvm machine create --from`),
+        # then start it.
+        try:
+            inner = native.Machine.create_from_pack(name, os.path.abspath(config.image))
+            transport = LocalTransport(inner, cleanup_on_exit=not config.detach, interceptor=binding)
+            transport.start(binding, config.wait_for_ports)
+            if not config.wait_for_ports:
+                _wait_for_execution(transport, config.ready_timeout_seconds)
+            return transport
+        except BaseException as e:
+            if transport is not None:
+                try:
+                    transport.delete()
+                except Exception:  # noqa: BLE001 - preserve the original failure
+                    pass
+            if isinstance(e, Exception):
+                raise wrap_native_error(e) from e
+            raise
     try:
         inner = native.Machine(_native_config(name, config))
         # A detached machine is meant to outlive this process, so the exit
@@ -2359,6 +2440,52 @@ def _wait_for_execution(transport: Transport, timeout_s: float) -> None:
                 raise
         time.sleep(min(0.2, max(0, deadline - time.monotonic())))
     raise SmolError("TIMEOUT", "guest execution did not become ready before the deadline")
+
+
+def _cloud_sizes(resources: Optional[dict]) -> "Optional[MachineSizes]":
+    if not resources or resources.get("cpus") is None or resources.get("memoryMb") is None:
+        return None
+    return MachineSizes(
+        cpus=resources["cpus"],
+        memory_mib=resources["memoryMb"],
+        storage_gib=resources.get("diskGb") or 20,
+    )
+
+
+def open_transport(machine_id: str, conn: Optional[ConnectOptions] = None) -> Transport:
+    """A handle to an existing machine that does not start it or wait for it.
+
+    * local: by name; raises ``NOT_FOUND`` when no machine has that name.
+    * cloud: by id, as :func:`connect_transport` (which does not wait there).
+    """
+    conn = conn or ConnectOptions()
+    explicit_key = conn.api_key or os.environ.get("SMOL_CLOUD_TOKEN")
+    use_cloud = conn.target == "cloud" or (conn.target != "local" and bool(explicit_key))
+    if not use_cloud:
+        try:
+            inner = _load_native().Machine.open(machine_id)
+        except Exception as e:  # noqa: BLE001 - native errors carry typed codes
+            raise wrap_native_error(e) from e
+        return LocalTransport(inner, cleanup_on_exit=False)
+    return connect_transport(machine_id, conn)
+
+
+def delete_machine_transport(
+    machine_id: str, conn: Optional[ConnectOptions] = None, drain_secs: Optional[float] = None
+) -> None:
+    """Delete a machine by name or id without a handle and without booting
+    it. Deleting one that does not exist succeeds."""
+    conn = conn or ConnectOptions()
+    explicit_key = conn.api_key or os.environ.get("SMOL_CLOUD_TOKEN")
+    use_cloud = conn.target == "cloud" or (conn.target != "local" and bool(explicit_key))
+    if not use_cloud:
+        try:
+            _load_native().Machine.delete_by_name(machine_id, drain_secs)
+        except Exception as e:  # noqa: BLE001
+            raise wrap_native_error(e) from e
+        return
+    _refuse_cloud_stop_options(drain_secs, None)
+    open_transport(machine_id, conn).delete()
 
 
 def connect_transport(machine_id: str, conn: Optional[ConnectOptions] = None) -> Transport:
@@ -2660,6 +2787,8 @@ def list_machines_transport(
                 branchable=m.branchable,
                 created_at=datetime.fromtimestamp(m.created_at, timezone.utc).isoformat(),
                 pid=m.pid,
+                resources=MachineSizes(cpus=m.cpus, memory_mib=m.memory_mib, storage_gib=m.storage_gib),
+                ports=_ports_from_native(list(m.ports)),
             )
             for m in records
         ]
@@ -2684,6 +2813,18 @@ def list_machines_transport(
                 persistent=not m.get("ephemeral", False),
                 branchable=bool(m.get("branchable", m.get("forkable", False))),
                 created_at=m.get("createdAt"),
+                resources=_cloud_sizes(m.get("resources")),
+                ports=[
+                    PublishedPort(
+                        guest=p["port"],
+                        host=p.get("hostPort"),
+                        protocol="udp" if p.get("protocol") == "udp" else "tcp",
+                    )
+                    for p in (m.get("ports") or [])
+                    if "port" in p
+                ]
+                if m.get("ports") is not None
+                else None,
             )
         )
     # Backstop for a control plane that ignores the label filter.

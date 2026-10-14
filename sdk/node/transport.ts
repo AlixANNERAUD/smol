@@ -58,6 +58,8 @@ import type {
   PortableCheckpointInfo,
   PortEndpoint,
   PortSpec,
+  PublishedPort,
+  StopOptions,
   WaitReadyOptions,
 } from "./types";
 // Cloud wire shapes are generated from smolfleet's OpenAPI document (npm run
@@ -150,11 +152,17 @@ export interface Transport {
   readonly machineId: string;
   sync(): Promise<void>;
   setNetworkPolicy(policy: NetworkPolicy): Promise<void>;
-  stop(): Promise<void>;
+  /** Published ports, whether or not the machine runs. (local) */
+  ports(): Promise<PublishedPort[]>;
+  /** Replace the published ports. (local) */
+  setPorts(ports: PublishedPort[]): Promise<void>;
+  /** Pack the stopped machine into a `.smolmachine`. (local) */
+  pack(output: string): Promise<string>;
+  stop(opts?: StopOptions): Promise<void>;
   pause(): Promise<void>;
   resume(waitUntilReady?: boolean): Promise<void>;
   start(interceptor?: EgressInterceptor, waitUntilReady?: boolean): Promise<void>;
-  delete(): Promise<void>;
+  delete(opts?: StopOptions): Promise<void>;
   /** Cloud only: delete and return the settled usage + cost in one call. */
   deleteWithUsage(): Promise<MachineUsageReport>;
   /** Cloud only: metered usage + cost; readable up to 30 days after delete. */
@@ -271,10 +279,21 @@ function toNativeExecOptions(
     workdir: opts.workdir,
     timeoutSecs: opts.timeout,
     user: opts.user,
+    stdin: stdinText(opts.stdin),
     env:
       opts.env &&
       Object.entries(opts.env).map(([key, value]) => ({ key, value })),
   };
+}
+
+/** `ExecOptions.stdin` as the text the agent protocol carries. */
+function stdinText(stdin: string | Uint8Array | undefined): string | undefined {
+  if (stdin === undefined || typeof stdin === "string") return stdin;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(stdin);
+  } catch {
+    throw new InvalidConfigError("exec stdin must be UTF-8 text.");
+  }
 }
 
 /** Drain an exec stream into an exec result, for an `exec` that must be
@@ -299,6 +318,14 @@ async function collectExec(
 /** A cloud exec request carrying the per-command `user`, which the control
  *  plane added after the generated schema. */
 type CloudCommandRequest = MachineCommandRequest & { user?: string };
+
+/** The cloud stop and delete take no drain or stop timeout yet; say so
+ *  rather than ignore them. */
+function refuseCloudStopOptions(opts?: StopOptions): void {
+  if (opts?.drainSecs !== undefined || opts?.timeoutSecs !== undefined) {
+    throw new NotSupportedError("drainSecs and timeoutSecs are local-only.");
+  }
+}
 
 /** The control plane echoes the user it ran a command as; an older one, which
  *  predates the field, echoes nothing because it silently dropped it. */
@@ -693,6 +720,39 @@ class LocalTransport implements Transport {
     }
   }
 
+  async ports(): Promise<PublishedPort[]> {
+    try {
+      return this.inner.publishedPorts().map((p) => ({
+        host: p.host,
+        guest: p.guest,
+        protocol: p.protocol === "udp" ? ("udp" as const) : ("tcp" as const),
+      }));
+    } catch (e) {
+      throw wrapNativeError(e);
+    }
+  }
+
+  async setPorts(ports: PublishedPort[]): Promise<void> {
+    try {
+      await this.inner.setPorts(
+        ports.map((p) => {
+          if (p.host === undefined) throw new InvalidConfigError(`port ${p.guest} has no host port`);
+          return { host: p.host, guest: p.guest, protocol: p.protocol };
+        }),
+      );
+    } catch (e) {
+      throw wrapNativeError(e);
+    }
+  }
+
+  async pack(output: string): Promise<string> {
+    try {
+      return await this.inner.pack(resolvePath(output));
+    } catch (e) {
+      throw wrapNativeError(e);
+    }
+  }
+
   async setNetworkPolicy(policy: NetworkPolicy): Promise<void> {
     try {
       this.inner.setEgressPolicy(egressPolicy(policy));
@@ -701,10 +761,10 @@ class LocalTransport implements Transport {
     }
   }
 
-  async stop(): Promise<void> {
+  async stop(opts?: StopOptions): Promise<void> {
     liveLocal.delete(this);
     try {
-      await this.inner.stop();
+      await this.inner.stop(opts && { drainSecs: opts.drainSecs, timeoutSecs: opts.timeoutSecs });
     } catch (e) {
       throw wrapNativeError(e);
     }
@@ -734,10 +794,10 @@ class LocalTransport implements Transport {
     if (waitUntilReady) await this.waitUntilReady();
   }
 
-  async delete(): Promise<void> {
+  async delete(opts?: StopOptions): Promise<void> {
     liveLocal.delete(this);
     try {
-      await this.inner.delete();
+      await this.inner.delete(opts && { drainSecs: opts.drainSecs });
     } catch (e) {
       throw wrapNativeError(e);
     }
@@ -1428,6 +1488,7 @@ class CloudTransport implements Transport {
       timeoutSeconds: opts?.timeout ?? null,
       ...(opts?.user !== undefined ? { user: opts.user } : {}),
       ...(opts?.background ? { background: true } : {}),
+      ...(opts?.stdin !== undefined ? { stdin: stdinText(opts.stdin) ?? null } : {}),
     };
     // The command may legitimately run far longer than the default cloud
     // timeout, so size the request abort timeout off the request's own timeout
@@ -1686,11 +1747,24 @@ class CloudTransport implements Transport {
     );
   }
 
+  async ports(): Promise<PublishedPort[]> {
+    throw new NotSupportedError("ports() is local-only; the cloud lists them in Machine.list().");
+  }
+
+  async setPorts(): Promise<void> {
+    throw new NotSupportedError("publish() and unpublish() are local-only.");
+  }
+
+  async pack(): Promise<string> {
+    throw new NotSupportedError("pack() is local-only; use checkpoint() on the cloud.");
+  }
+
   async setNetworkPolicy(): Promise<void> {
     throw new NotSupportedError("setNetworkPolicy() is local-only.");
   }
 
-  async stop(): Promise<void> {
+  async stop(opts?: StopOptions): Promise<void> {
+    refuseCloudStopOptions(opts);
     await cloudFetch(this.conn, "POST", `/v1/machines/${this.id}/stop`, { idempotent: true });
   }
 
@@ -1792,7 +1866,8 @@ class CloudTransport implements Transport {
     );
   }
 
-  async delete(): Promise<void> {
+  async delete(opts?: StopOptions): Promise<void> {
+    refuseCloudStopOptions(opts);
     await cloudFetch(this.conn, "DELETE", `/v1/machines/${this.id}`);
   }
 
@@ -2303,6 +2378,20 @@ export async function makeTransport(
     throw new InvalidConfigError("egressInterceptor cannot be combined with branchable machines.");
   }
   let transport: LocalTransport | undefined;
+  // A `.smolmachine` image is a packed machine: create from it (as
+  // `smolvm machine create --from`), then start it.
+  if (config.image?.endsWith(".smolmachine")) {
+    const owned = !config.detach && (conn.handleSignals ?? true);
+    try {
+      const inner = await getNapiMachine().createFromPack(name, resolvePath(config.image));
+      transport = new LocalTransport(inner, owned, interceptor, owned);
+      await transport.start(interceptor, config.waitForPorts !== false);
+      return transport;
+    } catch (e) {
+      await transport?.delete().catch(() => {});
+      throw wrapNativeError(e);
+    }
+  }
   try {
     // Validate the config before loading the engine, so a config the local
     // target cannot honour fails the same way whether or not it is installed.
@@ -2363,6 +2452,16 @@ export async function listMachines(
       detached: r.detached,
       branchable: r.branchable,
       createdAt: new Date(r.createdAt * 1000).toISOString(),
+      resources: {
+        cpus: r.resources.cpus,
+        memoryMib: r.resources.memoryMib,
+        storageGib: r.resources.storageGib,
+      },
+      ports: r.ports.map((p) => ({
+        host: p.host,
+        guest: p.guest,
+        protocol: p.protocol === "udp" ? ("udp" as const) : ("tcp" as const),
+      })),
     }));
   } else {
     // As in connectTransport: the CLI-login fallback applies only once the
@@ -2409,11 +2508,68 @@ export async function listMachines(
       detached: true,
       branchable: m.branchable ?? m.forkable ?? false,
       createdAt: m.createdAt,
+      ...(m.resources?.cpus != null &&
+        m.resources.memoryMb != null && {
+          resources: {
+            cpus: m.resources.cpus,
+            memoryMib: m.resources.memoryMb,
+            storageGib: m.resources.diskGb ?? 20,
+          },
+        }),
+      ...(m.ports && {
+        ports: m.ports.map((p) => ({
+          ...(p.hostPort != null && { host: p.hostPort }),
+          guest: p.port,
+          protocol: (p as { protocol?: string }).protocol === "udp" ? ("udp" as const) : ("tcp" as const),
+        })),
+      }),
     }));
   }
   const want = Object.entries(options.labels ?? {});
   if (want.length === 0) return all;
   return all.filter((m) => want.every(([k, v]) => m.labels[k] === v));
+}
+
+/**
+ * A handle to an existing machine that does not start it or wait for it —
+ * to read its state, stop, resize or delete it. Locally it fails with
+ * `NOT_FOUND` when no machine has that name; on the cloud it looks the
+ * machine up by id or name.
+ */
+export async function openTransport(id: string, conn: ConnectOptions): Promise<Transport> {
+  if (!selectsCloud(conn)) {
+    try {
+      return new LocalTransport(getNapiMachine().open(id), false, undefined, conn.handleSignals ?? true);
+    } catch (e) {
+      throw wrapNativeError(e);
+    }
+  }
+  // The cloud connect looks the machine up without starting it, and waits
+  // for nothing unless asked to.
+  const { waitForPorts: _ignored, ...rest } = conn;
+  return connectTransport(id, rest);
+}
+
+/**
+ * Delete a machine by name or id without a handle, whether or not it runs,
+ * and without booting it. Deleting a machine that does not exist succeeds.
+ */
+export async function deleteMachine(
+  id: string,
+  conn: ConnectOptions,
+  opts?: StopOptions,
+): Promise<void> {
+  if (!selectsCloud(conn)) {
+    try {
+      await getNapiMachine().deleteByName(id, opts && { drainSecs: opts.drainSecs });
+    } catch (e) {
+      throw wrapNativeError(e);
+    }
+    return;
+  }
+  refuseCloudStopOptions(opts);
+  const transport = await openTransport(id, conn);
+  await transport.delete();
 }
 
 /**
@@ -2439,10 +2595,12 @@ export async function connectTransport(
     try {
       // Connecting borrows an existing machine. A signal in this client must
       // not stop a durable checkpoint owned by another process/controller.
+      // The native connect boots off the JavaScript thread, so a slow boot
+      // does not hold the event loop.
       const transport = new LocalTransport(
         conn.egressInterceptor
-          ? getNapiMachine().connect(id, conn.egressInterceptor.address, conn.egressInterceptor.token)
-          : getNapiMachine().connect(id),
+          ? await getNapiMachine().connect(id, conn.egressInterceptor.address, conn.egressInterceptor.token)
+          : await getNapiMachine().connect(id),
         false,
         conn.egressInterceptor,
         conn.handleSignals ?? true,

@@ -10,12 +10,15 @@
 
 import { randomUUID } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
-import { ExecutionError, NotSupportedError, SmolError, wrapNativeError } from "./errors";
+import { createServer } from "node:net";
+import { ExecutionError, InvalidConfigError, NotSupportedError, SmolError, wrapNativeError } from "./errors";
 import { getNapiMachine } from "./native";
 import { localAvailability, type LocalAvailability } from "./availability";
 import {
   makeTransport,
   connectTransport,
+  openTransport,
+  deleteMachine,
   listMachines,
   deleteCheckpointTransport,
   restoreCheckpointTransport,
@@ -62,8 +65,23 @@ import type {
   PortableCheckpointInfo,
   PortEndpoint,
   PortSpec,
+  PublishedPort,
+  StopOptions,
   WaitReadyOptions,
 } from "./types";
+
+/** A host port free right now on loopback, for a publish that names none. */
+function freeHostPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close(() => (port ? resolve(port) : reject(new Error("no free port"))));
+    });
+  });
+}
 
 function makeExecResult(r: RawExec): ExecResult {
   const success = r.exitCode === 0;
@@ -134,6 +152,32 @@ export class Machine {
     conn: ConnectOptions = {},
   ): Promise<Machine> {
     return new Machine(await connectTransport(id, conn));
+  }
+
+  /**
+   * Open a handle to an EXISTING machine without starting it or waiting for
+   * it — to describe, stop, resize or delete it, including one that can no
+   * longer boot (its image is gone, the host lost KVM). `state()` reports
+   * `"stopped"` for a stopped machine. Call `start()` to boot it.
+   *  - local: by name; rejects with code `NOT_FOUND` when none exists.
+   *  - cloud: by id or name, as `connect`.
+   */
+  static async open(id: string, conn: ConnectOptions = {}): Promise<Machine> {
+    return new Machine(await openTransport(id, conn));
+  }
+
+  /**
+   * Delete a machine by name (cloud: id or name) without a handle and without
+   * booting it, whether it runs or not. Deleting one that does not exist
+   * succeeds. `drainSecs` lets running commands and transfers finish first
+   * (local).
+   */
+  static async delete(
+    id: string,
+    conn: ConnectOptions = {},
+    opts?: Pick<StopOptions, "drainSecs">,
+  ): Promise<void> {
+    return deleteMachine(id, conn, opts);
   }
 
   /**
@@ -415,9 +459,63 @@ export class Machine {
     return this.transport.setNetworkPolicy(policy);
   }
 
-  /** Stop the machine. */
-  stop(): Promise<void> {
-    return this.transport.stop();
+  /** The machine's published ports, whether or not it runs. (local) */
+  ports(): Promise<PublishedPort[]> {
+    return this.transport.ports();
+  }
+
+  /**
+   * Publish a guest port on the host — on a running machine too, without a
+   * restart. Without `host`, a free host port is picked. Returns the mapping
+   * now in effect. A running machine takes a TCP port now; a UDP port, or a
+   * machine not on virtio-net networking, needs it stopped. (local)
+   */
+  async publish(port: { guest: number; host?: number; protocol?: "tcp" | "udp" }): Promise<PublishedPort> {
+    const protocol = port.protocol ?? "tcp";
+    const host = port.host ?? (await freeHostPort());
+    const current = await this.transport.ports();
+    const mapping: PublishedPort = { host, guest: port.guest, protocol };
+    const next = current.filter((p) => !(p.host === host && p.protocol === protocol));
+    await this.transport.setPorts([...next, mapping]);
+    return mapping;
+  }
+
+  /**
+   * Stop publishing a port, matched by `guest` port (every host port
+   * forwarding to it) or by `host` port. Connections already open carry on.
+   * (local)
+   */
+  async unpublish(port: { guest?: number; host?: number; protocol?: "tcp" | "udp" }): Promise<void> {
+    if (port.guest === undefined && port.host === undefined) {
+      throw new InvalidConfigError("unpublish needs a guest or a host port.");
+    }
+    const protocol = port.protocol ?? "tcp";
+    const current = await this.transport.ports();
+    const next = current.filter(
+      (p) =>
+        p.protocol !== protocol ||
+        (port.guest !== undefined && p.guest !== port.guest) ||
+        (port.host !== undefined && p.host !== port.host),
+    );
+    if (next.length !== current.length) await this.transport.setPorts(next);
+  }
+
+  /**
+   * Pack this stopped machine into a `.smolmachine` at `path`: its disks and
+   * configuration in one artifact that stays on this host. Create machines
+   * from it with `Machine.create({ image: path })`. Returns the artifact's
+   * path. (local)
+   */
+  pack(path: string): Promise<string> {
+    return this.transport.pack(path);
+  }
+
+  /** Stop the machine. Its workload is sent its stop signal and given its
+   *  stop timeout to save state and exit first. A command or file transfer
+   *  still running rejects with code `INTERRUPTED` unless `drainSecs` lets it
+   *  finish; new ones are refused while the stop runs. */
+  stop(opts?: StopOptions): Promise<void> {
+    return this.transport.stop(opts);
   }
 
   /** Save RAM and disk durably, then stop at that execution boundary. */
@@ -438,13 +536,14 @@ export class Machine {
    *  `{ includeUsage: true }` to also get the fully settled usage + cost back
    *  in one call — the control plane takes a final metering sample before
    *  teardown, so nothing accrues after the returned report. */
-  delete(): Promise<void>;
+  delete(opts?: Pick<StopOptions, "drainSecs">): Promise<void>;
   delete(opts: { includeUsage: true }): Promise<MachineUsageReport>;
   delete(opts?: {
     includeUsage?: boolean;
+    drainSecs?: number;
   }): Promise<MachineUsageReport | void> {
     if (opts?.includeUsage) return this.transport.deleteWithUsage();
-    return this.transport.delete();
+    return this.transport.delete(opts?.drainSecs !== undefined ? { drainSecs: opts.drainSecs } : undefined);
   }
 
   /** Metered usage + cost for this machine (cloud target). Usage records

@@ -18,6 +18,12 @@ export interface NativeExecOptions {
   workdir?: string | undefined;
   timeoutSecs?: number | undefined;
   user?: string | undefined;
+  stdin?: string | undefined;
+}
+
+export interface NativeStopOptions {
+  drainSecs?: number | undefined;
+  timeoutSecs?: number | undefined;
 }
 
 export interface NativeHostMount {
@@ -80,6 +86,8 @@ export interface NativeMachineSummary {
   detached: boolean;
   branchable: boolean;
   createdAt: number;
+  resources: { cpus: number; memoryMib: number; storageGib: number; overlayGib: number };
+  ports: { host: number; guest: number; protocol: string }[];
 }
 
 export interface NativeExecResult {
@@ -174,16 +182,22 @@ export interface NapiMachine {
   execStream(command: string[], options?: NativeExecOptions): NativeExecStream;
   sync(): Promise<void>;
   setEgressPolicy(policy: { network: boolean; cidrs?: string[]; hosts?: string[] }): void;
-  stop(): Promise<void>;
+  stop(options?: NativeStopOptions): Promise<void>;
+  publishedPorts(): { host: number; guest: number; protocol: string }[];
+  setPorts(ports: { host: number; guest: number; protocol: string }[]): Promise<void>;
+  pack(output: string): Promise<string>;
   pause(): Promise<void>;
   resume(): Promise<void>;
-  delete(): Promise<void>;
+  delete(options?: NativeStopOptions): Promise<void>;
 }
 
 export interface NapiMachineCtor {
   new (config: NativeMachineConfig): NapiMachine;
   prepareImage(image: string): Promise<string>;
-  connect(name: string, interceptorAddress?: string, interceptorToken?: string): NapiMachine;
+  connect(name: string, interceptorAddress?: string, interceptorToken?: string): Promise<NapiMachine>;
+  open(name: string): NapiMachine;
+  deleteByName(name: string, options?: NativeStopOptions): Promise<void>;
+  createFromPack(name: string, pack: string): Promise<NapiMachine>;
   list(): Promise<NativeMachineSummary[]>;
   restoreCheckpoint(name: string, artifact: string, keepIdentity?: boolean): NapiMachine;
   exportCheckpoint(source: string, output: string): number;

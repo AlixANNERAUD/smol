@@ -67,6 +67,7 @@ fn err(e: SmolvmError) -> PyErr {
 fn code_and_message(e: &SmolvmError) -> (&'static str, String) {
     match e {
         SmolvmError::VmNotFound { name } => (NOT_FOUND, format!("VM not found: {name}")),
+        SmolvmError::Interrupted { .. } => ("INTERRUPTED", e.to_string()),
         SmolvmError::InvalidState { expected, actual } => (
             INVALID_STATE,
             format!("Invalid state: expected {expected}, got {actual}"),
@@ -175,6 +176,37 @@ struct LocalMachineSummary {
     created_at: u64,
     #[pyo3(get)]
     pid: Option<i32>,
+    #[pyo3(get)]
+    cpus: u32,
+    #[pyo3(get)]
+    memory_mib: u32,
+    #[pyo3(get)]
+    storage_gib: u64,
+    /// `(host, guest, protocol)` for each published port.
+    #[pyo3(get)]
+    ports: Vec<(u16, u16, String)>,
+}
+
+/// `(host, guest, protocol)` for each port `record` publishes.
+fn record_ports(record: &smolvm::config::VmRecord) -> Vec<(u16, u16, String)> {
+    record
+        .ports
+        .iter()
+        .map(|&(h, g)| (h, g, "tcp".to_string()))
+        .chain(record.udp_ports.iter().map(|&(h, g)| (h, g, "udp".to_string())))
+        .collect()
+}
+
+/// Engine stop options from seconds a caller passed, ignoring negatives.
+fn stop_options(drain_secs: Option<f64>, timeout_secs: Option<f64>) -> smolvm::embedded::StopOptions {
+    let secs = |s: Option<f64>| {
+        s.filter(|s| s.is_finite() && *s >= 0.0)
+            .map(std::time::Duration::from_secs_f64)
+    };
+    smolvm::embedded::StopOptions {
+        drain: secs(drain_secs),
+        stop_timeout: secs(timeout_secs),
+    }
 }
 
 /// Result of writing a portable live checkpoint to local disk.
@@ -225,6 +257,11 @@ fn parse_exec_opts(options: Option<&Bound<'_, PyDict>>) -> PyResult<ExecOptions>
         if let Some(u) = d.get_item("user")? {
             if !u.is_none() {
                 opts.user = Some(u.extract()?);
+            }
+        }
+        if let Some(i) = d.get_item("stdin")? {
+            if !i.is_none() {
+                opts.stdin = Some(i.extract()?);
             }
         }
         if let Some(e) = d.get_item("env")? {
@@ -754,6 +791,78 @@ impl Machine {
         Ok(Self { name })
     }
 
+    /// Open a handle to an existing machine without starting it. Raises
+    /// `[NOT_FOUND]` when no machine has that name.
+    #[staticmethod]
+    fn open(name: String) -> PyResult<Self> {
+        let runtime = runtime().map_err(err)?;
+        match runtime.machine_record(&name).map_err(err)? {
+            Some(_) => Ok(Self { name }),
+            None => Err(PyRuntimeError::new_err(format!("[NOT_FOUND] machine '{name}' not found"))),
+        }
+    }
+
+    /// Delete a machine by name, running or not, without booting it. One
+    /// that does not exist is already deleted.
+    #[staticmethod]
+    #[pyo3(signature = (name, drain_secs=None))]
+    fn delete_by_name(py: Python<'_>, name: String, drain_secs: Option<f64>) -> PyResult<()> {
+        let runtime = runtime().map_err(err)?;
+        let options = stop_options(drain_secs, None);
+        py.allow_threads(|| runtime.delete_machine_with(&name, &options))
+            .map_err(err)
+    }
+
+    /// Create the stopped machine `name` from a `.smolmachine` artifact.
+    #[staticmethod]
+    fn create_from_pack(py: Python<'_>, name: String, pack: String) -> PyResult<Self> {
+        let runtime = runtime().map_err(err)?;
+        py.allow_threads(|| runtime.create_machine_from_pack(&name, std::path::Path::new(&pack)))
+            .map_err(err)?;
+        Ok(Self { name })
+    }
+
+    /// `(host, guest, protocol)` for each published port, running or not.
+    fn published_ports(&self) -> PyResult<Vec<(u16, u16, String)>> {
+        let runtime = runtime().map_err(err)?;
+        let record = runtime
+            .machine_record(&self.name)
+            .map_err(err)?
+            .ok_or_else(|| PyRuntimeError::new_err(format!("[NOT_FOUND] machine '{}' not found", self.name)))?;
+        Ok(record_ports(&record))
+    }
+
+    /// Make `ports` (`(host, guest, protocol)` tuples) the published set. A
+    /// running machine changes TCP ports now; UDP ones need it stopped.
+    fn set_ports(&self, py: Python<'_>, ports: Vec<(u16, u16, String)>) -> PyResult<()> {
+        let mappings = ports
+            .into_iter()
+            .map(|(host, guest, protocol)| {
+                let protocol = match protocol.as_str() {
+                    "tcp" | "" => smolvm::data::network::PortProtocol::Tcp,
+                    "udp" => smolvm::data::network::PortProtocol::Udp,
+                    other => {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "[{CONFIG_ERROR}] unknown port protocol '{other}': use tcp or udp"
+                        )))
+                    }
+                };
+                Ok(smolvm::data::network::PortMapping::with_protocol(host, guest, protocol))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let runtime = runtime().map_err(err)?;
+        py.allow_threads(|| runtime.set_ports(&self.name, &mappings))
+            .map_err(err)
+    }
+
+    /// Pack this stopped machine into a `.smolmachine`; returns its path.
+    fn pack(&self, py: Python<'_>, output: String) -> PyResult<String> {
+        let runtime = runtime().map_err(err)?;
+        py.allow_threads(|| runtime.pack_machine(&self.name, std::path::Path::new(&output)))
+            .map_err(err)
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+
     /// List every machine in the host's shared database, without starting it.
     #[staticmethod]
     fn list(py: Python<'_>) -> PyResult<Vec<LocalMachineSummary>> {
@@ -768,6 +877,12 @@ impl Machine {
                         // gone; report one only while the state says it runs.
                         let pid = record.pid.filter(|_| state == "running");
                         LocalMachineSummary {
+                            cpus: u32::from(record.cpus),
+                            memory_mib: record.mem,
+                            storage_gib: record
+                                .storage_gb
+                                .unwrap_or(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB),
+                            ports: record_ports(&record),
                             state,
                             pid,
                             detached: record.detached,
@@ -1168,9 +1283,11 @@ impl Machine {
         Ok(imgs.into_iter().map(to_image_info).collect())
     }
 
-    fn stop(&self, py: Python<'_>) -> PyResult<()> {
+    #[pyo3(signature = (drain_secs=None, timeout_secs=None))]
+    fn stop(&self, py: Python<'_>, drain_secs: Option<f64>, timeout_secs: Option<f64>) -> PyResult<()> {
         let runtime = runtime().map_err(err)?;
-        py.allow_threads(|| runtime.stop_machine(&self.name))
+        let options = stop_options(drain_secs, timeout_secs);
+        py.allow_threads(|| runtime.stop_machine_with(&self.name, &options))
             .map_err(err)
     }
 
@@ -1186,9 +1303,11 @@ impl Machine {
             .map_err(err)
     }
 
-    fn delete(&self, py: Python<'_>) -> PyResult<()> {
+    #[pyo3(signature = (drain_secs=None))]
+    fn delete(&self, py: Python<'_>, drain_secs: Option<f64>) -> PyResult<()> {
         let runtime = runtime().map_err(err)?;
-        py.allow_threads(|| runtime.delete_machine(&self.name))
+        let options = stop_options(drain_secs, None);
+        py.allow_threads(|| runtime.delete_machine_with(&self.name, &options))
             .map_err(err)
     }
 }

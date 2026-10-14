@@ -88,6 +88,59 @@ pub struct MachineSummary {
     pub branchable: bool,
     /// Creation time, seconds since the Unix epoch.
     pub created_at: f64,
+    /// CPU, memory and disk sizes, readable whether or not it runs.
+    pub resources: MachineSizes,
+    /// Published ports, readable whether or not it runs.
+    pub ports: Vec<PublishedPort>,
+}
+
+impl MachineSummary {
+    /// Summarize `record`, whose state `state` is (the runtime's view).
+    pub fn from_record(record: smolvm::config::VmRecord, state: String) -> Self {
+        // The record keeps its last PID after the process is gone; report one
+        // only while the state says it is alive.
+        let pid = record.pid.filter(|_| state == "running");
+        let ports = record
+            .ports
+            .iter()
+            .map(|&(host, guest)| PublishedPort {
+                host,
+                guest,
+                protocol: "tcp".into(),
+            })
+            .chain(record.udp_ports.iter().map(|&(host, guest)| PublishedPort {
+                host,
+                guest,
+                protocol: "udp".into(),
+            }))
+            .collect();
+        MachineSummary {
+            state,
+            pid,
+            image: record.image.clone(),
+            labels: record
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            persistent: !record.ephemeral,
+            detached: record.detached,
+            branchable: record.forkable_on_start(),
+            created_at: record.created_at as f64,
+            resources: MachineSizes {
+                cpus: u32::from(record.cpus),
+                memory_mib: record.mem,
+                storage_gib: record
+                    .storage_gb
+                    .unwrap_or(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB) as f64,
+                overlay_gib: record
+                    .overlay_gb
+                    .unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB) as f64,
+            },
+            ports,
+            name: record.name,
+        }
+    }
 }
 
 /// Whether this host can run local machines, from the engine's own checks.
@@ -236,6 +289,62 @@ pub struct ExecOptions {
     /// Run the command as this user (image user name or `uid[:gid]`). Image
     /// machines only; a bare VM rejects it rather than run as root.
     pub user: Option<String>,
+    /// Text written to the command's stdin, which is then closed. It is
+    /// passed over the agent connection and never written to the guest disk.
+    pub stdin: Option<String>,
+}
+
+/// How a stop or delete treats work still running on the machine.
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct StopOptions {
+    /// Wait up to this many seconds for running commands and file transfers
+    /// to finish first. What is still running then fails with code
+    /// `INTERRUPTED`. Default: stop at once.
+    pub drain_secs: Option<f64>,
+    /// Seconds the workload gets to exit after its stop signal, instead of
+    /// the machine's stop timeout; 0 kills it at once. Stop only.
+    pub timeout_secs: Option<f64>,
+}
+
+impl StopOptions {
+    pub fn to_engine(options: Option<StopOptions>) -> smolvm::embedded::StopOptions {
+        let options = options.unwrap_or_default();
+        let secs = |s: Option<f64>| {
+            s.filter(|s| s.is_finite() && *s >= 0.0)
+                .map(std::time::Duration::from_secs_f64)
+        };
+        smolvm::embedded::StopOptions {
+            drain: secs(options.drain_secs),
+            stop_timeout: secs(options.timeout_secs),
+        }
+    }
+}
+
+/// CPU, memory and disk sizes of a machine.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct MachineSizes {
+    /// vCPUs.
+    pub cpus: u32,
+    /// Memory in MiB.
+    pub memory_mib: u32,
+    /// Storage disk in GiB.
+    pub storage_gib: f64,
+    /// Container overlay disk in GiB.
+    pub overlay_gib: f64,
+}
+
+/// One published port of a machine.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct PublishedPort {
+    /// Host port.
+    pub host: u16,
+    /// Guest port.
+    pub guest: u16,
+    /// `"tcp"` or `"udp"`.
+    pub protocol: String,
 }
 
 /// Options for writing a file into the VM.
@@ -430,5 +539,6 @@ pub fn parse_exec_options(options: Option<ExecOptions>) -> smolvm::embedded::Exe
             .timeout_secs
             .map(|s| std::time::Duration::from_secs(s as u64)),
         user: opts.user,
+        stdin: opts.stdin,
     }
 }

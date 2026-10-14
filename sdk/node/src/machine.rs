@@ -319,9 +319,46 @@ impl NapiMachine {
 
     /// Attach to an existing machine by name, starting it if stopped
     /// (start-or-reconnect). Lets a persisted machine be re-opened in a new
-    /// process — backs the SDK's local `Machine.connect()`.
+    /// process — backs the SDK's local `Machine.connect()`. The boot runs off
+    /// the JavaScript thread, so the event loop keeps serving while it waits.
+    #[napi]
+    pub async fn connect(
+        name: String,
+        interceptor_address: Option<String>,
+        interceptor_token: Option<String>,
+    ) -> napi::Result<NapiMachine> {
+        tokio::task::spawn_blocking(move || {
+            Self::connect_blocking(name, interceptor_address, interceptor_token)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// Open a handle to an existing machine without starting or connecting to
+    /// it, to read its state, stop, resize or delete it. Fails when no machine
+    /// of that name exists.
     #[napi(factory)]
-    pub fn connect(
+    pub fn open(name: String) -> napi::Result<Self> {
+        let runtime = runtime().into_napi()?;
+        match runtime.machine_record(&name).into_napi()? {
+            Some(_) => Ok(Self { name }),
+            None => Err(crate::error::not_found(format!("machine '{name}' not found"))),
+        }
+    }
+
+    /// Delete a machine by name, whether it runs or not, without booting it.
+    /// A machine that does not exist is already deleted.
+    #[napi]
+    pub async fn delete_by_name(name: String, options: Option<StopOptions>) -> napi::Result<()> {
+        let runtime = runtime().into_napi()?;
+        let options = StopOptions::to_engine(options);
+        tokio::task::spawn_blocking(move || runtime.delete_machine_with(&name, &options))
+            .await
+            .map_err(join_error)?
+            .into_napi()
+    }
+
+    fn connect_blocking(
         name: String,
         interceptor_address: Option<String>,
         interceptor_token: Option<String>,
@@ -364,24 +401,7 @@ impl NapiMachine {
                 .into_iter()
                 .map(|record| {
                     let state = runtime.state(&record.name);
-                    // The record keeps its last PID after the process is gone;
-                    // report one only while the state says it is alive.
-                    let pid = record.pid.filter(|_| state == "running");
-                    MachineSummary {
-                        state,
-                        pid,
-                        image: record.image.clone(),
-                        labels: record
-                            .labels
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        persistent: !record.ephemeral,
-                        detached: record.detached,
-                        branchable: record.forkable_on_start(),
-                        created_at: record.created_at as f64,
-                        name: record.name,
-                    }
+                    MachineSummary::from_record(record, state)
                 })
                 .collect();
             Ok(summaries)
@@ -859,12 +879,15 @@ impl NapiMachine {
             .into_napi()
     }
 
-    /// Stop the machine VM gracefully.
+    /// Stop the machine VM gracefully: its workload gets its stop signal and
+    /// stop timeout first. A command or file transfer still running fails
+    /// with code `INTERRUPTED` unless `drainSecs` lets it finish.
     #[napi]
-    pub async fn stop(&self) -> napi::Result<()> {
+    pub async fn stop(&self, options: Option<StopOptions>) -> napi::Result<()> {
         let runtime = runtime().into_napi()?;
         let name = self.name.clone();
-        tokio::task::spawn_blocking(move || runtime.stop_machine(&name))
+        let options = StopOptions::to_engine(options);
+        tokio::task::spawn_blocking(move || runtime.stop_machine_with(&name, &options))
             .await
             .map_err(join_error)?
             .into_napi()
@@ -891,12 +914,82 @@ impl NapiMachine {
             .into_napi()
     }
 
-    /// Stop the machine and clean up all storage (disks, config).
+    /// The machine's published ports, read from its record whether or not it
+    /// runs.
     #[napi]
-    pub async fn delete(&self) -> napi::Result<()> {
+    pub fn published_ports(&self) -> napi::Result<Vec<PublishedPort>> {
+        let runtime = runtime().into_napi()?;
+        let record = runtime
+            .machine_record(&self.name)
+            .into_napi()?
+            .ok_or_else(|| crate::error::not_found(format!("machine '{}' not found", self.name)))?;
+        Ok(MachineSummary::from_record(record, String::new()).ports)
+    }
+
+    /// Make `ports` the machine's published ports. A running machine changes
+    /// its TCP ports now; UDP ports, or any port of a machine not on
+    /// virtio-net, change only while it is stopped.
+    #[napi]
+    pub async fn set_ports(&self, ports: Vec<PublishedPort>) -> napi::Result<()> {
         let runtime = runtime().into_napi()?;
         let name = self.name.clone();
-        tokio::task::spawn_blocking(move || runtime.delete_machine(&name))
+        let mappings = ports
+            .iter()
+            .map(|p| {
+                let protocol = match p.protocol.as_str() {
+                    "tcp" | "" => smolvm::data::network::PortProtocol::Tcp,
+                    "udp" => smolvm::data::network::PortProtocol::Udp,
+                    other => {
+                        return Err(napi::Error::from_reason(format!(
+                            "[INVALID_CONFIG] unknown port protocol '{other}': use tcp or udp"
+                        )))
+                    }
+                };
+                Ok(smolvm::data::network::PortMapping::with_protocol(p.host, p.guest, protocol))
+            })
+            .collect::<napi::Result<Vec<_>>>()?;
+        tokio::task::spawn_blocking(move || runtime.set_ports(&name, &mappings))
+            .await
+            .map_err(join_error)?
+            .into_napi()
+    }
+
+    /// Pack this stopped machine into a `.smolmachine` at `output`; returns
+    /// the artifact's path.
+    #[napi]
+    pub async fn pack(&self, output: String) -> napi::Result<String> {
+        let runtime = runtime().into_napi()?;
+        let name = self.name.clone();
+        tokio::task::spawn_blocking(move || runtime.pack_machine(&name, std::path::Path::new(&output)))
+            .await
+            .map_err(join_error)?
+            .into_napi()
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+
+    /// Create the stopped machine `name` from a `.smolmachine` artifact.
+    #[napi]
+    pub async fn create_from_pack(name: String, pack: String) -> napi::Result<NapiMachine> {
+        let runtime = runtime().into_napi()?;
+        let created = name.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime.create_machine_from_pack(&created, std::path::Path::new(&pack))
+        })
+        .await
+        .map_err(join_error)?
+        .into_napi()?;
+        Ok(Self { name })
+    }
+
+    /// Stop the machine and clean up all storage (disks, config). A command or
+    /// file transfer still running fails with code `INTERRUPTED` unless
+    /// `drainSecs` lets it finish.
+    #[napi]
+    pub async fn delete(&self, options: Option<StopOptions>) -> napi::Result<()> {
+        let runtime = runtime().into_napi()?;
+        let name = self.name.clone();
+        let options = StopOptions::to_engine(options);
+        tokio::task::spawn_blocking(move || runtime.delete_machine_with(&name, &options))
             .await
             .map_err(join_error)?
             .into_napi()

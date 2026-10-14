@@ -77,6 +77,10 @@ export interface MachineSummary {
   branchable: boolean
   /** Creation time, seconds since the Unix epoch. */
   createdAt: number
+  /** CPU, memory and disk sizes, readable whether or not it runs. */
+  resources: MachineSizes
+  /** Published ports, readable whether or not it runs. */
+  ports: Array<PublishedPort>
 }
 /** Whether this host can run local machines, from the engine's own checks. */
 export interface HostAvailability {
@@ -214,6 +218,45 @@ export interface ExecOptions {
    * machines only; a bare VM rejects it rather than run as root.
    */
   user?: string
+  /**
+   * Text written to the command's stdin, which is then closed. It is
+   * passed over the agent connection and never written to the guest disk.
+   */
+  stdin?: string
+}
+/** How a stop or delete treats work still running on the machine. */
+export interface StopOptions {
+  /**
+   * Wait up to this many seconds for running commands and file transfers
+   * to finish first. What is still running then fails with code
+   * `INTERRUPTED`. Default: stop at once.
+   */
+  drainSecs?: number
+  /**
+   * Seconds the workload gets to exit after its stop signal, instead of
+   * the machine's stop timeout; 0 kills it at once. Stop only.
+   */
+  timeoutSecs?: number
+}
+/** CPU, memory and disk sizes of a machine. */
+export interface MachineSizes {
+  /** vCPUs. */
+  cpus: number
+  /** Memory in MiB. */
+  memoryMib: number
+  /** Storage disk in GiB. */
+  storageGib: number
+  /** Container overlay disk in GiB. */
+  overlayGib: number
+}
+/** One published port of a machine. */
+export interface PublishedPort {
+  /** Host port. */
+  host: number
+  /** Guest port. */
+  guest: number
+  /** `"tcp"` or `"udp"`. */
+  protocol: string
 }
 /** Options for writing a file into the VM. */
 export interface FileWriteOptions {
@@ -297,9 +340,21 @@ export declare class NapiMachine {
   /**
    * Attach to an existing machine by name, starting it if stopped
    * (start-or-reconnect). Lets a persisted machine be re-opened in a new
-   * process — backs the SDK's local `Machine.connect()`.
+   * process — backs the SDK's local `Machine.connect()`. The boot runs off
+   * the JavaScript thread, so the event loop keeps serving while it waits.
    */
-  static connect(name: string, interceptorAddress?: string | undefined | null, interceptorToken?: string | undefined | null): NapiMachine
+  static connect(name: string, interceptorAddress?: string | undefined | null, interceptorToken?: string | undefined | null): Promise<NapiMachine>
+  /**
+   * Open a handle to an existing machine without starting or connecting to
+   * it, to read its state, stop, resize or delete it. Fails when no machine
+   * of that name exists.
+   */
+  static open(name: string): NapiMachine
+  /**
+   * Delete a machine by name, whether it runs or not, without booting it.
+   * A machine that does not exist is already deleted.
+   */
+  static deleteByName(name: string, options?: StopOptions | undefined | null): Promise<void>
   /**
    * Every machine in this host's shared machine database, in name order.
    * The database is shared with the CLI and every other embedder on the
@@ -328,7 +383,7 @@ export declare class NapiMachine {
   /**
    * Start a command and return a live `ExecStream` of its output events. A
    * worker thread drives the engine's `exec_streaming_with` and feeds an mpsc
-   * channel the stream drains incrementally (no buffering).
+   * channel the stream drains incrementally (apart from partial UTF-8).
    */
   execStream(command: Array<string>, options?: ExecOptions | undefined | null): ExecStream
   /** Get the child PID if the VM is running. */
@@ -391,18 +446,45 @@ export declare class NapiMachine {
   execStreaming(command: Array<string>, options?: ExecOptions | undefined | null): Promise<Array<ExecStreamEvent>>
   /** Copy guest-local staged mounts back to their host sources. */
   sync(): Promise<void>
-  /** Stop the machine VM gracefully. */
-  stop(): Promise<void>
+  /**
+   * Stop the machine VM gracefully: its workload gets its stop signal and
+   * stop timeout first. A command or file transfer still running fails
+   * with code `INTERRUPTED` unless `drainSecs` lets it finish.
+   */
+  stop(options?: StopOptions | undefined | null): Promise<void>
   /** Save execution durably and stop the machine. */
   pause(): Promise<void>
   resume(): Promise<void>
-  /** Stop the machine and clean up all storage (disks, config). */
-  delete(): Promise<void>
+  /**
+   * The machine's published ports, read from its record whether or not it
+   * runs.
+   */
+  publishedPorts(): Array<PublishedPort>
+  /**
+   * Make `ports` the machine's published ports. A running machine changes
+   * its TCP ports now; UDP ports, or any port of a machine not on
+   * virtio-net, change only while it is stopped.
+   */
+  setPorts(ports: Array<PublishedPort>): Promise<void>
+  /**
+   * Pack this stopped machine into a `.smolmachine` at `output`; returns
+   * the artifact's path.
+   */
+  pack(output: string): Promise<string>
+  /** Create the stopped machine `name` from a `.smolmachine` artifact. */
+  static createFromPack(name: string, pack: string): Promise<NapiMachine>
+  /**
+   * Stop the machine and clean up all storage (disks, config). A command or
+   * file transfer still running fails with code `INTERRUPTED` unless
+   * `drainSecs` lets it finish.
+   */
+  delete(options?: StopOptions | undefined | null): Promise<void>
 }
 /**
  * A live, incremental exec stream. `next()` resolves with the next event as it
  * arrives (off the libuv loop via spawn_blocking), or `null` once the command
- * exits and the channel closes. Mirrors the Python SDK's ExecStream iterator.
+ * exits and the channel closes. Only an incomplete UTF-8 code point is held
+ * across events. Mirrors the Python SDK's ExecStream iterator.
  */
 export declare class ExecStream {
   next(): Promise<ExecStreamEvent | null>

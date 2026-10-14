@@ -312,6 +312,40 @@ export interface MachineSummary {
   branchable: boolean;
   /** When the machine was created (RFC3339). */
   createdAt: string;
+  /** CPU, memory and disk sizes, whether or not the machine runs. Missing
+   *  only from a control plane that does not report them. */
+  resources?: MachineSizes;
+  /** Published ports, whether or not the machine runs. `host` is the host
+   *  port forwarding to `guest`; on the cloud it is the node port, set once
+   *  the machine has been placed. */
+  ports?: PublishedPort[];
+}
+
+/** CPU, memory and disk sizes of a machine, as `Machine.list()` reports them. */
+export interface MachineSizes {
+  cpus: number;
+  memoryMib: number;
+  storageGib: number;
+}
+
+/** A published port, as `Machine.list()` reports it. */
+export interface PublishedPort {
+  host?: number;
+  guest: number;
+  protocol: "tcp" | "udp";
+}
+
+/** How `stop()` and `delete()` treat work still running on the machine. */
+export interface StopOptions {
+  /** Wait up to this many seconds for running commands and file transfers to
+   *  finish before stopping. Whatever still runs then rejects with
+   *  `SmolError` code `INTERRUPTED`. Default: stop at once. (local) */
+  drainSecs?: number;
+  /** Seconds the workload (the image ENTRYPOINT/CMD) gets to exit after its
+   *  stop signal before it is killed, instead of the machine's own stop
+   *  timeout; `0` kills it at once. `stop()` only; `delete()` never waits.
+   *  (local) */
+  timeoutSecs?: number;
 }
 
 /** Filters for `Machine.list()`. */
@@ -365,6 +399,10 @@ export interface ExecOptions {
    *  `NotSupportedError` — before running anything — if it predates them. It is
    *  never silently ignored. */
   user?: string;
+  /** Text written to the command's stdin, which is then closed. Passed over
+   *  the agent connection and never written to the machine's disk, so it can
+   *  carry a script or a secret. A `Uint8Array` must be UTF-8. */
+  stdin?: string | Uint8Array;
   /** Abort the command. Locally the command is killed in the machine and the
    *  call (or the `execStream` iteration) rejects with `signal.reason`. On the
    *  cloud target the request is cancelled and the call rejects the same way;
