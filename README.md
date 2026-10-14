@@ -163,7 +163,7 @@ finally:
 ## Quickstart — CLI
 
 ```bash
-smol run python:3.12 -- python -c "print(2**10)"   # ephemeral one-shot
+smol run -I python:3.12 --net -- python -c "print(2**10)"   # ephemeral one-shot
 smol machine create --name mybox --image alpine:3.20 --net   # persistent machine
 smol machine start --name mybox
 smol machine exec --name mybox -- apk add curl

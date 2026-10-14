@@ -8,11 +8,13 @@ use smolvm::DEFAULT_SHELL_CMD;
 
 #[derive(Args, Debug)]
 pub struct RunCmd {
-    /// Container image
+    /// Container image. Can also be given first, before `--`:
+    /// `smol run python:3.12 -- python -V`.
     #[arg(short = 'I', long, value_name = "IMAGE")]
     pub image: Option<String>,
 
-    /// Command to execute (after --)
+    /// `[IMAGE] -- COMMAND`: the command to execute, after `--`, optionally
+    /// preceded by the image.
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 
@@ -73,15 +75,26 @@ pub struct RunCmd {
 }
 
 impl RunCmd {
-    pub fn run(self) -> anyhow::Result<()> {
+    pub fn run(mut self) -> anyhow::Result<()> {
+        // `smol run IMAGE -- CMD`, the Docker shape people type (and our own
+        // README showed): one word before `--` is the image, not the command.
+        if self.image.is_none() {
+            if let Some(fixed) = options_after_image(&self.command) {
+                anyhow::bail!("options go before the image, as with `docker run`:\n  smol {fixed}");
+            }
+            if let Some((image, rest)) = split_positional_image(&self.command) {
+                self.image = Some(image);
+                self.command = rest;
+            }
+        }
         let command = strip_separator(&self.command);
 
         // Require explicit command or -it
         if !self.interactive && !self.tty && command.is_empty() {
             anyhow::bail!(
                 "no command specified.\n\
-                 Use: smol run --image <IMAGE> -- <command>\n\
-                 Or:  smol run -it --image <IMAGE>"
+                 Use: smol run <IMAGE> -- <command>\n\
+                 Or:  smol run -it <IMAGE>"
             );
         }
 
@@ -168,6 +181,18 @@ impl RunCmd {
                 }
                 use smolvm::data::image_source::{classify, resolve, ResolvedImage};
                 match resolve(classify(img))? {
+                    // Without outbound network the guest cannot pull, so fetch
+                    // the image on the host and boot it offline, exactly as
+                    // `smol machine start` does for a machine with no network.
+                    // With --net the guest pulls it itself, as before.
+                    ResolvedImage::Registry(reference) if !self.net => {
+                        let local = fetch_on_host(&reference)?;
+                        let dir = smolvm::data::image_source::packed_layers_dir_for_ref(&local)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("host-fetched image {local} has no local layers")
+                            })?;
+                        (Some(local), Some(dir))
+                    }
                     ResolvedImage::Registry(reference) => (Some(reference), None),
                     ResolvedImage::Local {
                         reference,
@@ -254,11 +279,16 @@ impl RunCmd {
             }
         } else {
             // Bare VM mode
+            let program = command[0].clone();
+            let explain = |error: smolvm::Error| missing_program_hint(&program, error);
             if self.interactive || self.tty {
-                client.vm_exec_interactive(command, env, self.workdir, None, self.tty)?
+                client
+                    .vm_exec_interactive(command, env, self.workdir, None, self.tty)
+                    .map_err(explain)?
             } else {
-                let (exit_code, stdout, stderr) =
-                    client.vm_exec(command, env, self.workdir, None, None)?;
+                let (exit_code, stdout, stderr) = client
+                    .vm_exec(command, env, self.workdir, None, None)
+                    .map_err(explain)?;
                 if !stdout.is_empty() {
                     print!("{}", String::from_utf8_lossy(&stdout));
                 }
@@ -282,6 +312,64 @@ impl RunCmd {
     }
 }
 
+/// `IMAGE -- CMD...` -> `(IMAGE, CMD...)`: exactly one word before the first
+/// `--` is an image. Anything else (no `--`, `--` first, several words before
+/// it) is left alone, so `smol run -- echo hi` still runs in the base machine.
+fn split_positional_image(args: &[String]) -> Option<(String, Vec<String>)> {
+    let separator = args.iter().position(|arg| arg == "--")?;
+    if separator != 1 {
+        return None;
+    }
+    Some((args[0].clone(), args[2..].to_vec()))
+}
+
+/// `IMAGE --net -- CMD`: clap hands everything after the image word to the
+/// command, so options placed there would be run as the program. Return the
+/// line with those options moved before the image, to tell the user.
+fn options_after_image(args: &[String]) -> Option<String> {
+    let separator = args.iter().position(|arg| arg == "--")?;
+    let (image, options) = args[..separator].split_first()?;
+    if image.starts_with('-') || !options.first()?.starts_with('-') {
+        return None;
+    }
+    let mut line = vec!["run".to_string()];
+    line.extend(options.iter().cloned());
+    line.push(image.clone());
+    line.extend(args[separator..].iter().cloned());
+    Some(line.join(" "))
+}
+
+/// Fetch a registry image on the host into the local image cache, returning
+/// the `local:` reference the guest boots from offline.
+fn fetch_on_host(reference: &str) -> anyhow::Result<String> {
+    print!("Pulling {reference}...");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let fetched = runtime.block_on(smolvm::image_store::fetch_image_archive(
+        reference,
+        &smolvm::registry::PullAuth::FromConfig,
+    ))?;
+    println!(" done.");
+    Ok(fetched.local)
+}
+
+/// The base machine is a minimal Linux without the user's tools; when a
+/// program is not there, say so and point at running it from an image.
+fn missing_program_hint(program: &str, error: smolvm::Error) -> anyhow::Error {
+    let message = error.to_string();
+    if message.contains("No such file or directory") && message.contains("spawn") {
+        return anyhow::anyhow!(
+            "`{program}` is not installed in the base machine (no image was given).\n\
+             Run it from an image instead, for example:\n  \
+             smol run python:3.12 -- {program} ...\n\
+             ({message})"
+        );
+    }
+    error.into()
+}
+
 /// Strip a leading `--` separator from a command vec if present.
 fn strip_separator(args: &[String]) -> Vec<String> {
     if args.first().map(|s| s.as_str()) == Some("--") {
@@ -293,6 +381,85 @@ fn strip_separator(args: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::split_positional_image;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    // The README form `smol run IMAGE -- CMD` names the image; every other
+    // shape keeps its meaning (a command for the base machine).
+    #[test]
+    fn one_word_before_the_separator_is_the_image() {
+        assert_eq!(
+            split_positional_image(&args(&["python:3.12", "--", "python", "-c", "print(1)"])),
+            Some((
+                "python:3.12".to_string(),
+                args(&["python", "-c", "print(1)"])
+            ))
+        );
+        assert_eq!(
+            split_positional_image(&args(&["alpine", "--", "ls", "--", "-la"])),
+            Some(("alpine".to_string(), args(&["ls", "--", "-la"])))
+        );
+        assert_eq!(split_positional_image(&args(&["--", "echo", "hi"])), None);
+        assert_eq!(split_positional_image(&args(&["echo", "hi"])), None);
+        assert_eq!(split_positional_image(&args(&["a", "b", "--", "c"])), None);
+    }
+
+    // `smol run IMAGE --net -- CMD` is refused with the corrected line rather
+    // than running `IMAGE` as a program in the base machine.
+    #[test]
+    fn options_after_the_image_get_the_corrected_line() {
+        use super::options_after_image;
+        assert_eq!(
+            options_after_image(&args(&[
+                "python:3.12",
+                "--net",
+                "-e",
+                "A=1",
+                "--",
+                "python",
+                "-V"
+            ]))
+            .as_deref(),
+            Some("run --net -e A=1 python:3.12 -- python -V")
+        );
+        assert_eq!(
+            options_after_image(&args(&["python:3.12", "--", "python"])),
+            None
+        );
+        assert_eq!(options_after_image(&args(&["--", "echo", "hi"])), None);
+        assert_eq!(options_after_image(&args(&["echo", "hi"])), None);
+    }
+
+    // What clap actually hands `run` for the README line, so the split above
+    // sees the image word and the separator.
+    #[test]
+    fn clap_passes_the_image_word_and_separator_through() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            run: super::RunCmd,
+        }
+        let cli =
+            Cli::try_parse_from(["smol", "python:3.12", "--", "python", "-c", "print(2**10)"])
+                .unwrap();
+        assert_eq!(cli.run.image, None);
+        assert_eq!(
+            split_positional_image(&cli.run.command),
+            Some((
+                "python:3.12".to_string(),
+                args(&["python", "-c", "print(2**10)"])
+            ))
+        );
+        let bare = Cli::try_parse_from(["smol", "--", "echo", "hi"]).unwrap();
+        assert_eq!(split_positional_image(&bare.run.command), None);
+        let flag = Cli::try_parse_from(["smol", "-I", "alpine", "--", "echo"]).unwrap();
+        assert_eq!(flag.run.image.as_deref(), Some("alpine"));
+    }
+
     /// Bare / Docker-convention image names must never be treated as smolmachine
     /// packs: the probe short-circuits them to `None` (no registry round-trip),
     /// so `run`/`create` fall through to the ordinary image path instead of
