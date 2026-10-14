@@ -173,7 +173,7 @@ impl UpCmd {
         let user = dev.user.or(sf.user);
 
         // Create or update record
-        let ports_tuples = PortMapping::to_tuples(&ports);
+        let (ports_tuples, udp_ports) = PortMapping::split_tuples(&ports);
         let (mounts_tuples, staged_mounts) = HostMount::split_storage_tuples(&mounts);
         // Virtiofs binding form (tag, guest_target, read_only) for running init
         // inside the image container — computed before `mounts` is consumed by
@@ -194,6 +194,7 @@ impl UpCmd {
             let mut record =
                 VmRecord::new(name.clone(), cpus, mem, mounts_tuples, ports_tuples, net);
             record.staged_mounts = staged_mounts;
+            record.udp_ports = udp_ports;
             record.image = sf.image.clone();
             record.env = env.clone();
             record.workdir = workdir.clone();

@@ -72,8 +72,8 @@ impl StatusCmd {
                 if !r.mounts.is_empty() || !r.staged_mounts.is_empty() {
                     println!("  Mounts: {}", r.mounts.len() + r.staged_mounts.len());
                 }
-                if !r.ports.is_empty() {
-                    println!("  Ports: {}", r.ports.len());
+                if !r.ports.is_empty() || !r.udp_ports.is_empty() {
+                    println!("  Ports: {}", r.ports.len() + r.udp_ports.len());
                 }
             }
         } else {

@@ -42,7 +42,7 @@ pub struct RunCmd {
     pub volume: Vec<String>,
 
     /// Expose port (HOST:GUEST)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST[/udp]")]
     pub port: Vec<PortMapping>,
 
     /// Enable outbound network access

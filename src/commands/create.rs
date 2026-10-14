@@ -57,8 +57,8 @@ pub struct CreateCmd {
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     pub volume: Vec<String>,
 
-    /// Expose port (HOST:GUEST)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    /// Expose port (HOST:GUEST, append /udp for UDP)
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST[/udp]")]
     pub port: Vec<PortMapping>,
 
     /// Attach metadata to the machine (repeatable), e.g.
@@ -157,7 +157,7 @@ impl CreateCmd {
         let (mounts, staged_mounts) =
             smolvm::data::storage::HostMount::split_storage_tuples(&parsed_mounts);
 
-        let ports = smolvm::data::network::PortMapping::to_tuples(&self.port);
+        let (ports, udp_ports) = smolvm::data::network::PortMapping::split_tuples(&self.port);
 
         let env = smolvm::util::parse_env_list(&self.env);
 
@@ -185,6 +185,7 @@ impl CreateCmd {
         let mut record =
             smolvm::config::VmRecord::new(name.clone(), self.cpus, self.mem, mounts, ports, net);
         record.staged_mounts = staged_mounts;
+        record.udp_ports = udp_ports;
         if !allow_cidrs.is_empty() {
             record.allowed_cidrs = Some(allow_cidrs);
         }
@@ -291,7 +292,7 @@ impl CreateCmd {
         let parsed_mounts = smolvm::data::storage::HostMount::parse(&host_volume_specs)?;
         let (mounts, staged_mounts) =
             smolvm::data::storage::HostMount::split_storage_tuples(&parsed_mounts);
-        let ports = smolvm::data::network::PortMapping::to_tuples(&self.port);
+        let (ports, udp_ports) = smolvm::data::network::PortMapping::split_tuples(&self.port);
         let mut env = smolvm::util::parse_env_list(&manifest.env);
         env.extend(smolvm::util::parse_env_list(&self.env));
 
@@ -304,6 +305,7 @@ impl CreateCmd {
             self.net || manifest.network,
         );
         record.staged_mounts = staged_mounts;
+        record.udp_ports = udp_ports;
         record.image = Some(manifest.image);
         record.remote_volumes = remote_volumes;
         // CLI trailing args override the artifact's baked (entrypoint, cmd),

@@ -25,10 +25,10 @@ pub struct UpdateCmd {
     pub remove_volume: Vec<String>,
 
     /// Add port mapping (HOST:GUEST)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST[/udp]")]
     pub port: Vec<PortMapping>,
     /// Remove port mapping (HOST:GUEST)
-    #[arg(long = "remove-port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    #[arg(long = "remove-port", value_parser = PortMapping::parse, value_name = "HOST:GUEST[/udp]")]
     pub remove_port: Vec<PortMapping>,
 
     /// Set vCPU count
@@ -148,21 +148,12 @@ impl UpdateCmd {
         // Reject duplicate host ports after the proposed changes.
         {
             let mut final_ports: Vec<PortMapping> = record
-                .ports
-                .iter()
-                .filter(|&&(h, g)| {
-                    !self
-                        .remove_port
-                        .iter()
-                        .any(|rm| rm.host == h && rm.guest == g)
-                })
-                .map(|&(h, g)| PortMapping::new(h, g))
+                .port_mappings()
+                .into_iter()
+                .filter(|existing| !self.remove_port.contains(existing))
                 .collect();
             for p in &self.port {
-                if !final_ports
-                    .iter()
-                    .any(|e| e.host == p.host && e.guest == p.guest)
-                {
+                if !final_ports.contains(p) {
                     final_ports.push(*p);
                 }
             }
@@ -229,20 +220,21 @@ impl UpdateCmd {
                     r.remote_volumes.push(rv.clone());
                 }
             }
+            let mut ports = r.port_mappings();
             for rm in &self.remove_port {
-                let before = r.ports.len();
-                r.ports.retain(|&(h, g)| h != rm.host || g != rm.guest);
-                if r.ports.len() < before {
-                    changes.push(format!("  removed port: {}:{}", rm.host, rm.guest));
+                let before = ports.len();
+                ports.retain(|existing| existing != rm);
+                if ports.len() < before {
+                    changes.push(format!("  removed port: {}", rm.label()));
                 }
             }
             for p in &self.port {
-                let tuple = p.to_tuple();
-                if !r.ports.contains(&tuple) {
-                    changes.push(format!("  added port: {}:{}", tuple.0, tuple.1));
-                    r.ports.push(tuple);
+                if !ports.contains(p) {
+                    changes.push(format!("  added port: {}", p.label()));
+                    ports.push(*p);
                 }
             }
+            r.set_port_mappings(&ports);
             if let Some(cpus) = self.cpus {
                 changes.push(format!("  cpus: {} → {cpus}", r.cpus));
                 r.cpus = cpus;

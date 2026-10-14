@@ -58,7 +58,7 @@ impl ForkBatchCmd {
             return self.run_cloud(names);
         }
 
-        let pinned = PortMapping::to_tuples(&self.port);
+        let pinned = super::fork::tcp_pins(&self.port)?;
         let db = smolvm::db::SmolvmDb::open()?;
         let runtime = smolvm::embedded::EmbeddedRuntime::with_db(db.clone());
         runtime.fork_machines_detached(&self.golden, &names, &pinned, self.parallel)?;
@@ -105,6 +105,7 @@ impl ForkBatchCmd {
     }
 
     fn run_cloud(self, names: Vec<String>) -> anyhow::Result<()> {
+        super::fork::tcp_pins(&self.port)?;
         let body = serde_json::json!({
             "names": names,
             "ports": self.port.iter().map(|port| {
