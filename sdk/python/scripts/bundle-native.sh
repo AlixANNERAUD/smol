@@ -208,6 +208,11 @@ else
   echo "bundle-native: WARNING — SMOLVM_ROOTFS_TAR not set/found; wheel ships no guest rootfs (boot needs one already on the host)" >&2
 fi
 
+# Disk templates beside the rootfs tarball: the engine finds them there and gives
+# each image machine a qcow2 overlay on its image seed instead of a full copy
+# (Linux without reflink). See scripts/build-disk-templates.sh.
+bash "$(dirname "${BASH_SOURCE[0]}")/../../../scripts/build-disk-templates.sh" "$DEST"
+
 if [ "$copied" -eq 0 ]; then
   echo "bundle-native: WARNING — no libkrun/libkrunfw libs found in $LIB_DIR" >&2
   exit 1

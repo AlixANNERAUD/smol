@@ -19,3 +19,4 @@ dist/
 # Bundled engine libs staged by scripts/bundle-native.sh (regenerable; never commit)
 python/smol/libkrun*
 python/smol/libkrunfw*
+python/smol/*-template.ext4.zst

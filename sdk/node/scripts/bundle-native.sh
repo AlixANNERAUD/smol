@@ -48,6 +48,11 @@ else
   echo "bundle-native: WARNING — SMOLVM_ROOTFS_TAR not set/found; package ships no guest rootfs (boot needs one already on the host)" >&2
 fi
 
+# Disk templates beside the rootfs tarball: the engine finds them there and gives
+# each image machine a qcow2 overlay on its image seed instead of a full copy
+# (Linux without reflink). See scripts/build-disk-templates.sh.
+bash "$(dirname "${BASH_SOURCE[0]}")/../../../scripts/build-disk-templates.sh" "$DEST"
+
 # macOS: a GPU-enabled libkrun.dylib load-links Homebrew libepoxy/virglrenderer
 # by ABSOLUTE path. GPU is unused by the SDK, but those load commands must
 # resolve or `dlopen` fails on any Mac without those formulae ("Library not
