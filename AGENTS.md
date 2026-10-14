@@ -17,7 +17,7 @@ transport is chosen at connect time, not by using a different API.
 | | Local (embedded microVM) | Cloud (smolfleet) |
 |---|---|---|
 | macOS Apple Silicon | ✅ Hypervisor.framework | ✅ |
-| Linux x86_64 / arm64 | ✅ needs `/dev/kvm`, glibc ≥ 2.34 | ✅ |
+| Linux x86_64 / arm64 | ✅ needs `/dev/kvm`, glibc ≥ 2.31 (Ubuntu 20.04+, Debian 11+) | ✅ |
 | Anything else | ❌ | ✅ pure-language, runs anywhere |
 
 Prebuilt SDK packages bundle everything the local transport needs (the `libkrun`

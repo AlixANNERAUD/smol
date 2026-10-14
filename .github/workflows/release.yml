@@ -161,8 +161,8 @@ jobs:
           cache: npm
           cache-dependency-path: sdk/node/package-lock.json
       - run: npm ci
-      # Linux: build the addon + helper against glibc 2.34 (libkrun's real floor)
-      # via zig, so they load on glibc 2.34+ — not just the 2.39 build runner. The
+      # Linux: build the addon + helper against glibc 2.31 (the engine's floor)
+      # via zig, so they load on glibc 2.31+ — not just the 2.39 build runner. The
       # raw runner is glibc 2.39, which would silently break local transport on
       # e.g. Ubuntu 22.04. macOS has no glibc floor (Mach-O), so zig is Linux-only.
       - name: Set up zig (Linux glibc-floor cross-link)
@@ -185,7 +185,7 @@ jobs:
           # aarch64-linux only: rustc emits `-Wl,--fix-cortex-a53-843419`, which
           # zig 0.13's driver rejects and which breaks napi's `--zig` link. Shim
           # `zig` ahead on PATH to strip that one flag, keeping napi's own zig
-          # handling (CC/target translation + the glibc-2.34 pin) intact.
+          # handling (CC/target translation + the glibc-2.31 pin) intact.
           if [ "$RUNNER_OS" = "Linux" ] && [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export REAL_ZIG="$(command -v zig)"
             mkdir -p "$RUNNER_TEMP/zigshim"
@@ -194,7 +194,7 @@ jobs:
             export PATH="$RUNNER_TEMP/zigshim:$PATH"
           fi
           if [ "$RUNNER_OS" = "Linux" ]; then
-            npm run build:native -- --target ${{ matrix.target }} --zig --zig-abi-suffix=2.34
+            npm run build:native -- --target ${{ matrix.target }} --zig --zig-abi-suffix=2.31
           else
             npm run build:native -- --target ${{ matrix.target }}
           fi
@@ -208,10 +208,10 @@ jobs:
           LIBKRUN_BUNDLE: ${{ github.workspace }}/__engine__/${{ matrix.lib_subdir }}
           SMOLVM_LIB_DIR: ${{ github.workspace }}/__engine__/${{ matrix.lib_subdir }}
         # Both use --target so output is uniformly target/<triple>/release/smolvm.
-        # Linux: zigbuild pins glibc 2.34; macOS: native build.
+        # Linux: zigbuild pins glibc 2.31; macOS: native build.
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
-            cargo zigbuild --release --target ${{ matrix.target }}.2.34 --bin smolvm --manifest-path __engine__/Cargo.toml
+            cargo zigbuild --release --target ${{ matrix.target }}.2.31 --bin smolvm --manifest-path __engine__/Cargo.toml
           else
             cargo build --release --target ${{ matrix.target }} --bin smolvm --manifest-path __engine__/Cargo.toml
           fi
@@ -389,7 +389,7 @@ jobs:
         run: perl -i -pe 's{\.\./\.\./\.\.}{../../__engine__}g' sdk/python/Cargo.toml
       # The local transport spawns a smol-vmm boot helper (the engine's `smolvm`
       # binary) — on macOS it carries the hypervisor entitlement (the python
-      # process can't). Build it on the runner host (glibc 2.34 via zig on Linux),
+      # process can't). Build it on the runner host (glibc 2.31 via zig on Linux),
       # bundled into the wheel by the staging step below.
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -410,7 +410,7 @@ jobs:
           SMOLVM_LIB_DIR: ${{ github.workspace }}/__engine__/${{ matrix.lib_subdir }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
-            cargo zigbuild --release --target ${{ matrix.target }}.2.34 --bin smolvm --manifest-path __engine__/Cargo.toml
+            cargo zigbuild --release --target ${{ matrix.target }}.2.31 --bin smolvm --manifest-path __engine__/Cargo.toml
           else
             cargo build --release --target ${{ matrix.target }} --bin smolvm --manifest-path __engine__/Cargo.toml
           fi
@@ -455,12 +455,12 @@ jobs:
         with:
           working-directory: sdk/python
           target: ${{ matrix.target }}
-          # Build _native in the manylinux_2_34 container (glibc 2.34), NOT on the
-          # glibc-2.39 runner. The bundled libkrun's true floor is 2.34 (measured),
-          # so building _native against 2.34 lets the wheel honestly tag
-          # manylinux_2_34 — covering RHEL9 / Ubuntu 22.04+ / Debian 12 / AL2023,
-          # instead of the artifact 2.39 (Ubuntu 24.04 only). Ignored on macOS.
-          manylinux: "2_34"
+          # Build _native in the manylinux_2_28 container, NOT on the glibc-2.39
+          # runner, so _native itself needs no newer glibc than the bundled
+          # engine, whose floor is 2.31; the relabel step below tags the wheel
+          # manylinux_2_31 to match that floor — Ubuntu 20.04+ / Debian 11+ /
+          # RHEL 9 / AL2023. Ignored on macOS.
+          manylinux: "2_28"
           # --skip-auditwheel: the wheel deliberately bundles libkrun/libkrunfw,
           # which auditwheel would otherwise re-vendor and break our $ORIGIN rpath.
           # This leaves the wheel tagged linux_* (PyPI-rejected) — the next step
@@ -478,7 +478,9 @@ jobs:
           python3 -m pip install --quiet auditwheel patchelf
           mkdir -p dist_manylinux
           for whl in dist/*.whl; do
-            auditwheel repair \
+            # The bundled engine needs glibc 2.31, so claim that, not the
+            # older floor auditwheel would detect from _native alone.
+            auditwheel repair --plat "manylinux_2_31_$(uname -m)" \
               --exclude libkrun.so.1 --exclude libkrunfw.so.5 \
               --exclude libkrun.so --exclude libkrunfw.so \
               --exclude smol_virgl_stub.so \
