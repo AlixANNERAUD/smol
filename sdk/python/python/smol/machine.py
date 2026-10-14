@@ -530,6 +530,20 @@ class Machine:
         existing URL immediately stops granting access."""
         self._t.unshare()
 
+    def port_links(self) -> "dict[int, str]":
+        """A URL for each published port that reaches it with no login (cloud
+        target), keyed by guest port: for a client that cannot send an API key,
+        such as a sandbox framework calling its tunnel URLs. Anyone holding a
+        link reaches the port, so treat it as a credential. The machine keeps one
+        token, so calling again returns the same links; a port published later
+        appears on the next call. :meth:`revoke_port_links` revokes them."""
+        return self._t.port_links()
+
+    def revoke_port_links(self) -> None:
+        """Revoke this machine's port links (cloud target): every link stops
+        working at once, and the next :meth:`port_links` issues new ones."""
+        self._t.revoke_port_links()
+
     def publish_cache_disk(self) -> PublishedCacheDisk:
         """Publish this machine's cache disk, the version it started from plus
         everything it wrote, as its cache disk's next version (cloud target).

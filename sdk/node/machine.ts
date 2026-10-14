@@ -573,6 +573,22 @@ export class Machine {
     return this.transport.unshare();
   }
 
+  /** A URL for each published port that reaches it with no login (cloud
+   *  target), keyed by guest port: for a client that cannot send an API key,
+   *  such as a sandbox framework calling its tunnel URLs. Anyone holding a link
+   *  reaches the port, so treat it as a credential. The machine keeps one
+   *  token, so calling again returns the same links; a port published later
+   *  appears on the next call. {@link revokePortLinks} revokes them. */
+  portLinks(): Promise<Record<number, string>> {
+    return this.transport.portLinks();
+  }
+
+  /** Revoke this machine's port links (cloud target): every link stops working
+   *  at once, and the next {@link portLinks} issues new ones. */
+  revokePortLinks(): Promise<void> {
+    return this.transport.revokePortLinks();
+  }
+
   /** Publish this machine's cache disk, the version it started from plus
    *  everything it wrote, as its cache disk's next version (cloud target).
    *  Stop the machine first: a running machine is still writing it. */

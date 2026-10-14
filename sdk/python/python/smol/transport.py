@@ -166,6 +166,8 @@ class Transport(Protocol):
     def delete_with_usage(self) -> MachineUsageReport: ...
     def usage(self) -> MachineUsageReport: ...
     def share(self) -> ShareLink: ...
+    def port_links(self) -> "dict[int, str]": ...
+    def revoke_port_links(self) -> None: ...
     def unshare(self) -> None: ...
     def publish_cache_disk(self) -> PublishedCacheDisk: ...
     def checkpoint(
@@ -909,6 +911,14 @@ class LocalTransport:
             "share() is cloud-only; a local machine has no published app URL to hand out."
         )
 
+    def port_links(self) -> "dict[int, str]":
+        raise NotSupportedError(
+            "port_links() is cloud-only; a local machine's ports are on this host (see endpoint())."
+        )
+
+    def revoke_port_links(self) -> None:
+        raise NotSupportedError("revoke_port_links() is cloud-only; a local machine has no port links.")
+
     def unshare(self) -> None:
         raise NotSupportedError(
             "unshare() is cloud-only; a local machine has no share link to revoke."
@@ -1539,6 +1549,13 @@ class CloudTransport:
 
     def unshare(self) -> None:
         _cloud_fetch(self._base, self._key, "DELETE", f"/v1/machines/{self._id}/share")
+
+    def port_links(self) -> "dict[int, str]":
+        r = _cloud_fetch(self._base, self._key, "POST", f"/v1/machines/{self._id}/port-links") or {}
+        return {int(port): url for port, url in (r.get("urls") or {}).items()}
+
+    def revoke_port_links(self) -> None:
+        _cloud_fetch(self._base, self._key, "DELETE", f"/v1/machines/{self._id}/port-links")
 
     def publish_cache_disk(self) -> PublishedCacheDisk:
         r = _cloud_fetch(

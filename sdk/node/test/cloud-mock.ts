@@ -195,6 +195,15 @@ const server = createServer(async (req, res) => {
   if (method === "POST" && url === "/v1/machines/m-restored/start") {
     return json(200, { id: "m-restored", state: "started" });
   }
+  if (method === "POST" && url === "/v1/machines/m1/port-links") {
+    seen.portLinksPosts = (seen.portLinksPosts ?? 0) + 1;
+    return json(200, { urls: { "3000": "https://p3000-tok.apps.example", "8080": "https://p8080-tok.apps.example" } });
+  }
+  if (method === "DELETE" && url === "/v1/machines/m1/port-links") {
+    seen.portLinksRevoked = true;
+    res.writeHead(204);
+    return res.end();
+  }
   if (method === "POST" && url === "/v1/machines/m1/resize") {
     seen.resizeBody = JSON.parse((await readBody(req)).toString() || "{}");
     return json(200, {
@@ -982,6 +991,16 @@ async function main(): Promise<void> {
     overlayRefused = e instanceof SmolError;
   }
   check("resize refuses overlayGb on the cloud", overlayRefused);
+
+  // --- port links: a login-free URL per published port ---
+  const links = await m.portLinks();
+  check(
+    "portLinks returns each port's URL, keyed by number",
+    links[3000] === "https://p3000-tok.apps.example" && links[8080] === "https://p8080-tok.apps.example" && seen.portLinksPosts === 1,
+    JSON.stringify(links),
+  );
+  await m.revokePortLinks();
+  check("revokePortLinks sends DELETE /port-links", seen.portLinksRevoked === true);
 
   // --- ports: publish and unpublish on the running machine ---
   const publishedPort = await m.publish({ guest: 3000, host: 9999 });
