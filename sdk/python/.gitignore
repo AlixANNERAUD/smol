@@ -20,3 +20,5 @@ dist/
 python/smol/libkrun*
 python/smol/libkrunfw*
 python/smol/*-template.ext4.zst
+python/smol/THIRD_PARTY_NOTICES.md
+python/smol/licenses/

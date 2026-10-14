@@ -152,5 +152,11 @@ else
   fi
 fi
 
+# License texts and notices for everything bundled above, so the platform
+# package carries them. The engine checkout supplies the libkrun/libkrunfw pins.
+python3 "$PKG_DIR/../../scripts/third_party_notices.py" "$DEST" \
+  ${SMOLVM_ENGINE_DIR:+--engine "$SMOLVM_ENGINE_DIR"} \
+  $([ -f "$DEST/agent-rootfs.tar" ] && printf -- '--rootfs %s' "$DEST/agent-rootfs.tar")
+
 echo "bundled -> $DEST"
 ls -la "$DEST"
