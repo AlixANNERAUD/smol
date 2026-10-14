@@ -91,7 +91,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Linux: link against glibc 2.34 (libkrun's real floor) via zig, so the
+      # Linux: link against glibc 2.31 (the engine's floor) via zig, so the
       # binary loads on Ubuntu 22.04+/RHEL9/Debian 12 — not just the build runner.
       - name: Set up zig
         if: matrix.use_zig == '1'
@@ -124,7 +124,7 @@ jobs:
           SMOLVM_ENGINE_VERSION: ${{ env.ENGINE_VERSION }}
           TARGET: ${{ matrix.target }}
           USE_ZIG: ${{ matrix.use_zig }}
-          ZIG_GLIBC: "2.34"
+          ZIG_GLIBC: "2.31"
         run: bash scripts/build-smol-dist.sh ${{ matrix.platform }}
 
       - uses: actions/upload-artifact@v4
