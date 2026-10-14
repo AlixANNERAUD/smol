@@ -435,7 +435,8 @@ class Machine:
         self._t.stop(drain_secs, timeout_secs)
 
     def ports(self) -> "list[PublishedPort]":
-        """The machine's published ports, whether or not it runs. (local)"""
+        """The machine's published ports, whether or not it runs. On the cloud
+        each host port is the node's, and a port not placed yet reports host 0."""
         return self._t.ports()
 
     def publish(
@@ -444,21 +445,24 @@ class Machine:
         """Publish a guest port on the host — on a running machine too,
         without a restart. Without ``host``, a free host port is picked.
         Returns the mapping now in effect. A running machine takes a TCP port
-        now; a UDP port, or a machine not on virtio-net, needs it stopped.
-        (local)"""
+        now; a UDP port, or a machine not on virtio-net, needs it stopped. On
+        the cloud the machine's node picks the host port (``host`` is ignored)
+        and ports are TCP; reach the port with ``connect`` or the machine's URL."""
         if protocol not in ("tcp", "udp"):
             raise InvalidConfigError(f"unknown port protocol {protocol!r}: use tcp or udp")
         mapping = PublishedPort(guest=guest, host=host or _free_host_port(), protocol=protocol)  # type: ignore[arg-type]
         current = [p for p in self._t.ports() if not (p.host == mapping.host and p.protocol == protocol)]
         self._t.set_ports([*current, mapping])
-        return mapping
+        # Report what took effect: on the cloud the node chose the host port.
+        now = [p for p in self._t.ports() if p.guest == guest and p.protocol == protocol]
+        return next((p for p in now if p.host == mapping.host), now[0] if now else mapping)
 
     def unpublish(
         self, guest: Optional[int] = None, host: Optional[int] = None, protocol: str = "tcp"
     ) -> None:
         """Stop publishing a port, matched by ``guest`` port (every host port
         forwarding to it) or by ``host`` port. Connections already open carry
-        on. (local)"""
+        on."""
         if guest is None and host is None:
             raise InvalidConfigError("unpublish needs a guest or a host port")
         current = self._t.ports()

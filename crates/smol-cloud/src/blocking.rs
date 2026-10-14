@@ -379,6 +379,22 @@ impl Client {
         )
     }
 
+    /// Make `guest_ports` the machine's published ports, the whole set. A
+    /// running machine serves new ports at once and stops serving removed
+    /// ones; the machine's node picks each host port.
+    pub fn set_ports(&self, id: &str, guest_ports: &[u16]) -> Result<Machine> {
+        let ports: Vec<serde_json::Value> = guest_ports
+            .iter()
+            .map(|port| serde_json::json!({ "port": port }))
+            .collect();
+        self.json(
+            reqwest::Method::PUT,
+            &format!("/v1/machines/{id}/ports"),
+            Body::Json(serde_json::json!({ "ports": ports })),
+            REQUEST_TIMEOUT,
+        )
+    }
+
     /// Save execution durably and stop the machine.
     pub fn pause(&self, id: &str) -> Result<()> {
         self.empty(
