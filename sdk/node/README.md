@@ -205,10 +205,14 @@ vLLM's unrestricted adapter loader.
 ```ts
 import { Machine } from 'smolmachines';
 
-const m = await Machine.create({ resources: { cpus: 2, memoryMb: 1024 } });
+// A machine of an image. The image is pulled once; later machines of the same
+// image start from it in about a second.
+const m = await Machine.create({
+  image: 'python:3.12',
+  resources: { cpus: 2, memoryMb: 1024, network: true },
+});
 try {
-  // Run a command in a container image
-  const res = await m.run('python:3.12', ['python', '-c', 'print(2 ** 10)']);
+  const res = await m.exec(['python', '-c', 'print(2 ** 10)']);
   res.assertSuccess();
   console.log(res.stdout); // "1024\n"
 

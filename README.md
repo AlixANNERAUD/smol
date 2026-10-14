@@ -114,10 +114,14 @@ same host as its parent, because it shares that parent's memory pages.
 ```ts
 import { Machine } from 'smolmachines';
 
-// Local: no server, no config.
-const m = await Machine.create({ resources: { cpus: 2, memoryMb: 1024, network: true } });
+// Local: no server, no config. The image is pulled once; later machines of the
+// same image start from it in about a second.
+const m = await Machine.create({
+  image: 'python:3.12',
+  resources: { cpus: 2, memoryMb: 1024, network: true },
+});
 try {
-  const r = await m.run('python:3.12', ['python', '-c', 'print(2 ** 10)']);
+  const r = await m.exec(['python', '-c', 'print(2 ** 10)']);
   console.log(r.stdout);            // 1024
   await m.writeFile('/tmp/in.txt', 'hi');
   console.log((await m.readFile('/tmp/in.txt')).toString());
@@ -143,9 +147,11 @@ try {
 ```python
 from smol import Machine, MachineConfig, ResourceSpec, ConnectOptions
 
-# Local (embedded microVM) — context-managed, auto-deletes on exit.
-with Machine.create(MachineConfig(resources=ResourceSpec(cpus=2, memory_mb=1024, network=True))) as m:
-    r = m.run("python:3.12", ["python", "-c", "print(2 ** 10)"]).assert_success()
+# Local (embedded microVM) — context-managed, auto-deletes on exit. The image is
+# pulled once; later machines of the same image start from it in about a second.
+config = MachineConfig(image="python:3.12", resources=ResourceSpec(cpus=2, memory_mb=1024, network=True))
+with Machine.create(config) as m:
+    r = m.exec(["python", "-c", "print(2 ** 10)"]).assert_success()
     print(r.stdout)                  # 1024
 
 # Cloud — create() waits until the guest agent is reachable. A cloud state of
