@@ -17,8 +17,48 @@ export interface CloudErrorDetail {
   retryAfterMs?: number | undefined;
 }
 
+/** The stable codes a `SmolError` carries, to branch on instead of matching
+ *  message text (which may change). Unknown codes from a newer engine or
+ *  control plane still type-check as plain strings.
+ *
+ *  - `NOT_FOUND`: no such machine, file (`readFile` of a missing path),
+ *    image or checkpoint.
+ *  - `INTERRUPTED`: a `stop()` or `delete()` cut off this command or file
+ *    transfer (local). `MACHINE_INTERRUPTED`: the same, on the cloud.
+ *  - `CONFLICT`: the machine's state does not allow it now (it is being
+ *    stopped or deleted, it has dependent branches, ...). `INVALID_STATE`:
+ *    the same, from an older engine path.
+ *  - `INVALID_CONFIG`: a usage error in the arguments. `CONFIG_ERROR`: the
+ *    engine refused a configuration value. `NOT_SUPPORTED`: not on this
+ *    target.
+ *  - `KVM_UNAVAILABLE`, `HYPERVISOR_UNAVAILABLE`: this host cannot run
+ *    machines. `STORAGE_ERROR`, `MOUNT_ERROR`: disk or mount failures.
+ *  - `COMMAND_FAILED`: a command exited non-zero (`assertSuccess()`).
+ *  - `TIMEOUT`, `CONNECTION`, `UNAUTHORIZED`: cloud transport failures.
+ *  - `SMOLVM_ERROR`: anything not classified above. */
+export type SmolErrorCode =
+  | "NOT_FOUND"
+  | "INTERRUPTED"
+  | "MACHINE_INTERRUPTED"
+  | "CONFLICT"
+  | "INVALID_STATE"
+  | "FORBIDDEN"
+  | "INVALID_CONFIG"
+  | "CONFIG_ERROR"
+  | "NOT_SUPPORTED"
+  | "KVM_UNAVAILABLE"
+  | "HYPERVISOR_UNAVAILABLE"
+  | "STORAGE_ERROR"
+  | "MOUNT_ERROR"
+  | "COMMAND_FAILED"
+  | "TIMEOUT"
+  | "CONNECTION"
+  | "UNAUTHORIZED"
+  | "SMOLVM_ERROR"
+  | (string & {});
+
 export class SmolError extends Error {
-  readonly code: string;
+  readonly code: SmolErrorCode;
   /** HTTP status, for an error the cloud API returned. */
   readonly status?: number | undefined;
   /** The server's stable problem code, for an error the cloud API returned. */
@@ -29,7 +69,7 @@ export class SmolError extends Error {
   readonly retryable: boolean;
   /** How long the server asked callers to wait before retrying (ms). */
   readonly retryAfterMs?: number | undefined;
-  constructor(code: string, message: string, detail?: CloudErrorDetail) {
+  constructor(code: SmolErrorCode, message: string, detail?: CloudErrorDetail) {
     super(message);
     this.name = new.target.name;
     this.code = code;

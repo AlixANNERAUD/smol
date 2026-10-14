@@ -15,12 +15,15 @@ pub const CONFIG_ERROR: &str = "CONFIG_ERROR";
 pub const COMMAND_FAILED: &str = "COMMAND_FAILED";
 pub const KVM_UNAVAILABLE: &str = "KVM_UNAVAILABLE";
 pub const SMOLVM_ERROR: &str = "SMOLVM_ERROR";
+/// A stop or delete of the machine cut off the command or file transfer.
+pub const INTERRUPTED: &str = "INTERRUPTED";
 
 /// The JavaScript `error.code` and message for an engine error. Shared by
 /// [`to_napi_error`] and the host probe, so both report the same codes.
 pub fn code_and_message(err: &SmolvmError) -> (&'static str, String) {
     match err {
         SmolvmError::VmNotFound { name } => (NOT_FOUND, format!("VM not found: {}", name)),
+        SmolvmError::Interrupted { .. } => (INTERRUPTED, err.to_string()),
 
         SmolvmError::InvalidState { expected, actual } => (
             INVALID_STATE,
@@ -92,6 +95,11 @@ pub fn code_and_message(err: &SmolvmError) -> (&'static str, String) {
 
         _ => (SMOLVM_ERROR, err.to_string()),
     }
+}
+
+/// A `NOT_FOUND` error with `message`.
+pub fn not_found(message: String) -> napi::Error {
+    napi::Error::new(Status::GenericFailure, format!("[{NOT_FOUND}] {message}"))
 }
 
 /// Convert a smolvm::Error into a napi::Error with an appropriate error code.
