@@ -178,6 +178,10 @@ export interface Transport {
   share(): Promise<ShareLink>;
   /** Cloud only: revoke the machine's anonymous share link. */
   unshare(): Promise<void>;
+  /** Cloud only: a login-free URL for each published port, by port. */
+  portLinks(): Promise<Record<number, string>>;
+  /** Cloud only: revoke the machine's port links. */
+  revokePortLinks(): Promise<void>;
   /** Cloud only: publish a stopped machine's cache disk as its next version. */
   publishCacheDisk(): Promise<PublishedCacheDisk>;
   checkpoint(output?: string, options?: CheckpointOptions): Promise<PortableCheckpointInfo>;
@@ -831,6 +835,16 @@ class LocalTransport implements Transport {
     throw new NotSupportedError(
       "unshare() is cloud-only; a local machine has no share link to revoke.",
     );
+  }
+
+  async portLinks(): Promise<Record<number, string>> {
+    throw new NotSupportedError(
+      "portLinks() is cloud-only; a local machine's ports are on this host (see endpoint()).",
+    );
+  }
+
+  async revokePortLinks(): Promise<void> {
+    throw new NotSupportedError("revokePortLinks() is cloud-only; a local machine has no port links.");
   }
 
   async publishCacheDisk(): Promise<PublishedCacheDisk> {
@@ -1922,6 +1936,19 @@ class CloudTransport implements Transport {
       "DELETE",
       `/v1/machines/${this.id}/share`,
     );
+  }
+
+  async portLinks(): Promise<Record<number, string>> {
+    const out = await cloudFetch<{ urls?: Record<string, string> }>(
+      this.conn,
+      "POST",
+      `/v1/machines/${this.id}/port-links`,
+    );
+    return Object.fromEntries(Object.entries(out.urls ?? {}).map(([port, url]) => [Number(port), url]));
+  }
+
+  async revokePortLinks(): Promise<void> {
+    await cloudFetch<unknown>(this.conn, "DELETE", `/v1/machines/${this.id}/port-links`);
   }
 
   async publishCacheDisk(): Promise<PublishedCacheDisk> {

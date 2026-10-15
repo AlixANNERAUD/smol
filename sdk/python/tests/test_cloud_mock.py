@@ -203,6 +203,11 @@ class Handler(BaseHTTPRequestHandler):
             }).encode())
         if self.path == "/v1/machines/mach-restored/start":
             return self._send(200, json.dumps({"id": "mach-restored", "state": "started"}).encode())
+        if self.path == f"/v1/machines/{MACHINE_ID}/port-links":
+            captured["port_links_posts"] = captured.get("port_links_posts", 0) + 1
+            return self._send(200, json.dumps({"urls": {
+                "3000": "https://p3000-tok.apps.example", "8080": "https://p8080-tok.apps.example",
+            }}).encode())
         if self.path == f"/v1/machines/{MACHINE_ID}/resize":
             captured["resize_body"] = json.loads(self._read() or b"{}")
             body = captured["resize_body"]
@@ -443,6 +448,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == f"/v1/machines/{MACHINE_ID}/share":
             captured["unshared"] = True
             return self._send(204)
+        if self.path == f"/v1/machines/{MACHINE_ID}/port-links":
+            return self._send(204)
         if self.path == "/v1/checkpoints/ckpt-old":
             return self._send(204)
         if self.path == f"/v1/machines/{MACHINE_ID}":
@@ -646,6 +653,14 @@ def main() -> int:
         m.unpublish(guest=3000)
         check("unpublish sends the remaining set",
               captured["ports_bodies"][-1] == {"ports": [{"port": 8080}]}, str(captured["ports_bodies"][-1]))
+
+        # --- port links: a login-free URL per published port ---
+        links = m.port_links()
+        check("port_links returns each port's URL, keyed by int",
+              links == {3000: "https://p3000-tok.apps.example", 8080: "https://p8080-tok.apps.example"}, str(links))
+        m.revoke_port_links()
+        check("revoke_port_links sends DELETE /port-links",
+              f"DELETE /v1/machines/{MACHINE_ID}/port-links" in captured["hits"])
 
         # --- branch: live-RAM child over the cloud ---
         clone = m.branch(

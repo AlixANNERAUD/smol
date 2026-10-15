@@ -380,6 +380,14 @@ class AsyncMachine:
         """Revoke this machine's anonymous share link (cloud target)."""
         await asyncio.to_thread(self._m.unshare)
 
+    async def port_links(self) -> "dict[int, str]":
+        """A login-free URL for each published port; see :meth:`Machine.port_links`."""
+        return await asyncio.to_thread(self._m.port_links)
+
+    async def revoke_port_links(self) -> None:
+        """Revoke this machine's port links; see :meth:`Machine.revoke_port_links`."""
+        await asyncio.to_thread(self._m.revoke_port_links)
+
     async def publish_cache_disk(self) -> "PublishedCacheDisk":
         """Publish this machine's cache disk as its cache disk's next version
         (cloud target). Stop the machine first."""
