@@ -101,8 +101,10 @@ for (const triple of triples) {
   const helper = join(pkgDir, 'native', 'smol-vmm');
   if (!existsSync(helper)) fail(`${name}: missing native/smol-vmm`);
   chmodSync(helper, 0o755);
-  const rootfs = join(pkgDir, 'native', 'agent-rootfs.tar');
-  if (!existsSync(rootfs) || statSync(rootfs).size === 0) fail(`${name}: missing native/agent-rootfs.tar`);
+  const rootfs = ['agent-rootfs.tar.zst', 'agent-rootfs.tar']
+    .map((file) => join(pkgDir, 'native', file))
+    .find((path) => existsSync(path) && statSync(path).size > 0);
+  if (!rootfs) fail(`${name}: missing native/agent-rootfs.tar.zst (or .tar)`);
   for (const lib of platform.libs) {
     if (!existsSync(join(pkgDir, 'native', lib))) fail(`${name}: missing native/${lib}`);
   }

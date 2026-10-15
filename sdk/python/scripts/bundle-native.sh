@@ -202,8 +202,16 @@ fi
 # ship a rootfs dir tree (symlinks/modes), so we ship the tarball. CI builds it
 # with scripts/build-agent-rootfs.sh and points SMOLVM_ROOTFS_TAR at the tarball.
 if [ -n "${SMOLVM_ROOTFS_TAR:-}" ] && [ -f "${SMOLVM_ROOTFS_TAR}" ]; then
-  cp -f "$SMOLVM_ROOTFS_TAR" "$DEST/agent-rootfs.tar"
-  echo "staged agent-rootfs.tar into $DEST"
+  # Shipped zstd-compressed (about a third of the size); the engine decompresses
+  # it while extracting, needing no zstd on the user's host.
+  rm -f "$DEST/agent-rootfs.tar" "$DEST/agent-rootfs.tar.zst"
+  if command -v zstd >/dev/null 2>&1; then
+    zstd -19 -T0 -q -f "$SMOLVM_ROOTFS_TAR" -o "$DEST/agent-rootfs.tar.zst"
+    echo "staged agent-rootfs.tar.zst into $DEST ($(du -h "$DEST/agent-rootfs.tar.zst" | cut -f1))"
+  else
+    cp -f "$SMOLVM_ROOTFS_TAR" "$DEST/agent-rootfs.tar"
+    echo "staged agent-rootfs.tar into $DEST (zstd not found; shipping it uncompressed)"
+  fi
 else
   echo "bundle-native: WARNING — SMOLVM_ROOTFS_TAR not set/found; wheel ships no guest rootfs (boot needs one already on the host)" >&2
 fi
@@ -222,5 +230,5 @@ fi
 # The engine checkout supplies the libkrun/libkrunfw pins.
 python3 "$PY_ROOT/../../scripts/third_party_notices.py" "$DEST" \
   ${SMOLVM_ENGINE_DIR:+--engine "$SMOLVM_ENGINE_DIR"} \
-  $([ -f "$DEST/agent-rootfs.tar" ] && printf -- '--rootfs %s' "$DEST/agent-rootfs.tar")
+  $([ -f "${SMOLVM_ROOTFS_TAR:-}" ] && printf -- '--rootfs %s' "$SMOLVM_ROOTFS_TAR")
 echo "bundle-native: staged $copied lib(s) from $LIB_DIR into $DEST"

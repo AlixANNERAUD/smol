@@ -88,8 +88,12 @@ func resolveRuntimeAssets() (*runtimeAssets, error) {
 	if helper := filepath.Join(dir, "smol-vmm"); fileExists(helper) {
 		a.bootBinary = helper
 	}
-	if rootfs := filepath.Join(dir, "agent-rootfs.tar"); fileExists(rootfs) {
-		a.agentRootfsTar = rootfs
+	// Shipped zstd-compressed; an older bundle has the plain tar.
+	for _, name := range []string{"agent-rootfs.tar.zst", "agent-rootfs.tar"} {
+		if rootfs := filepath.Join(dir, name); fileExists(rootfs) {
+			a.agentRootfsTar = rootfs
+			break
+		}
 	}
 	// The engine reads these itself, but a value set with os.Setenv after
 	// start-up is not visible to it when cgo is off, so pass them on.
