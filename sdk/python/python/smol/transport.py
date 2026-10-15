@@ -241,7 +241,10 @@ def _bundled_paths() -> "tuple[Optional[str], str, Optional[str]]":
     tarball that is not shipped reads as None."""
     pkg = os.path.dirname(os.path.realpath(__file__))
     helper = os.path.join(pkg, "smol-vmm.exe" if os.name == "nt" else "smol-vmm")
-    rootfs_tar = os.path.join(pkg, "agent-rootfs.tar")
+    # Shipped zstd-compressed; an older or locally built wheel has the plain tar.
+    rootfs_tar = os.path.join(pkg, "agent-rootfs.tar.zst")
+    if not os.path.exists(rootfs_tar):
+        rootfs_tar = os.path.join(pkg, "agent-rootfs.tar")
     return (
         helper if os.path.exists(helper) else None,
         pkg,

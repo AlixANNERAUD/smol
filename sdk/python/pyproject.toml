@@ -80,6 +80,7 @@ include = [
     "python/smol/smol_virgl_stub.so",
     "python/smol/smol-vmm",
     "python/smol/agent-rootfs.tar",
+    "python/smol/agent-rootfs.tar.zst",
     # Disk templates (Linux): bundle-native.sh builds them beside the rootfs tarball.
     "python/smol/*-template.ext4.zst",
     # Notices and license texts for the bundled components (bundle-native.sh).

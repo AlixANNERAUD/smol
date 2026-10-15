@@ -94,7 +94,9 @@ export function wireBundledAssets(): RuntimeAssets {
     if (!assets.libDir) {
       assets.libDir = nativeDir;
     }
-    const rootfsTar = join(nativeDir, 'agent-rootfs.tar');
+    // Shipped zstd-compressed; an older or locally built package has the plain tar.
+    const compressedRootfs = join(nativeDir, 'agent-rootfs.tar.zst');
+    const rootfsTar = existsSync(compressedRootfs) ? compressedRootfs : join(nativeDir, 'agent-rootfs.tar');
     if (!assets.agentRootfs && !assets.agentRootfsTar && existsSync(rootfsTar)) {
       assets.agentRootfsTar = rootfsTar;
     }

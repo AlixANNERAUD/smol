@@ -24,9 +24,11 @@ case "$PLAT" in
   *) echo "unsupported platform: $PLAT" >&2; exit 1 ;;
 esac
 
-for f in "$NATIVE/smol-vmm" "$NATIVE/agent-rootfs.tar" "$LIB"; do
+for f in "$NATIVE/smol-vmm" "$LIB"; do
   [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
 done
+[ -f "$NATIVE/agent-rootfs.tar.zst" ] || [ -f "$NATIVE/agent-rootfs.tar" ] \
+  || { echo "missing $NATIVE/agent-rootfs.tar.zst (or .tar)" >&2; exit 1; }
 
 NAME="smol-go-runtime-$VERSION-$PLAT"
 STAGE="$(mktemp -d)/$NAME"
